@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "k-sounds-hub"
-version = "0.4.1"
+dynamic = ["version"]
 description = "PipeWire-first modular Linux audio hub"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
   { name = "Kooy" }
 ]
@@ -24,9 +24,12 @@ dev = [
 ]
 
 [project.scripts]
-k-sounds-hub = "ksound_hub.app:main"
-ksound-hub = "ksound_hub.app:main"
+k-sounds-hub = "ksound_hub.glass_app:main"
+ksound-hub = "ksound_hub.glass_app:main"
 ksound-control = "ksound_hub.control:main"
+k-sounds-hub-glass = "ksound_hub.glass_app:main"
+ksound-hub-glass = "ksound_hub.glass_app:main"
+k-sounds-hub-classic = "ksound_hub.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -40,6 +43,9 @@ ksound_hub = [
   "assets/*",
   "assets/**/*"
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "ksound_hub._version.__version__"}
 
 [tool.ruff]
 line-length = 100

@@ -40,11 +40,12 @@ def test_build_eq_slot_signature_and_status():
     profile = EqProfile(name="Cinema", bands=[EqBand(frequency=1000.0, gain_db=1.5, q=0.8)])
     target = PlaybackTarget(label="System default", sink_name="alsa_output.test")
 
-    signature = json.loads(_build_eq_slot_signature("media", profile, target))
+    signature = json.loads(_build_eq_slot_signature("media", profile, target, 100))
     status = _build_eq_slot_status(profile_name="Cinema", target_label="System default", muted=False, volume=85)
 
     assert signature["key"] == "media"
     assert signature["target_label"] == "System default"
     assert signature["target_sink"] == "alsa_output.test"
     assert signature["profile"]["name"] == "Cinema"
+    assert signature["stereo_width"] == 100
     assert status == "active (Cinema → System default) • vol 85%"

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import copy
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -27,8 +29,9 @@ class EqProfileDialog(QDialog):
     def __init__(self, profile: EqProfile, parent=None, *, title: str = "Edit EQ preset"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 360)
-        install_window_geometry(self, "eq_profile", default_size=(560, 360))
+        self.setFocusPolicy(Qt.ClickFocus)
+        self.resize(760, 420)
+        install_window_geometry(self, "eq_profile", default_size=(760, 420))
 
         self._source_profile = copy.deepcopy(profile)
         self._initial_profile = copy.deepcopy(profile)
@@ -36,7 +39,9 @@ class EqProfileDialog(QDialog):
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(95)
+        # Debounced live preview: avoid rebuilding/reapplying EQ on every tiny slider tick.
+        # This keeps the dialog responsive and reduces audible update artifacts.
+        self._preview_timer.setInterval(180)
         self._preview_timer.timeout.connect(self._emit_preview)
 
         root = QVBoxLayout(self)
@@ -52,7 +57,7 @@ class EqProfileDialog(QDialog):
         form.addRow("Preset", self.name_edit)
         root.addLayout(form)
 
-        hint = QLabel("Simple 8-band EQ. Changes are previewed live until you Save or Cancel.")
+        hint = QLabel("10-band EQ. Gain moves in 0.5 dB steps. Double-click a frequency to edit it.")
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -64,8 +69,13 @@ class EqProfileDialog(QDialog):
 
         self.band_sliders: list[EqBandSlider] = []
         for band in profile.bands:
-            slider = EqBandSlider(self._band_label(band.frequency), int(band.gain_db))
+            slider = EqBandSlider(
+                self._band_label(band.frequency),
+                float(band.gain_db),
+                frequency=float(band.frequency),
+            )
             slider.slider.valueChanged.connect(self._on_live_changed)
+            slider.frequencyChanged.connect(self._on_live_changed)
             self.band_sliders.append(slider)
             bands_row.addWidget(slider)
         root.addWidget(bands_wrap, 1)
@@ -74,6 +84,28 @@ class EqProfileDialog(QDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self._cancel_without_saving)
         root.addWidget(self.buttons)
+
+        self._install_background_focus_clear_filter()
+
+    def _install_background_focus_clear_filter(self) -> None:
+        self.installEventFilter(self)
+        for widget in self.findChildren(QWidget):
+            widget.installEventFilter(self)
+
+    def _is_focus_preserving_widget(self, widget: QWidget | None) -> bool:
+        while widget is not None and widget is not self:
+            if isinstance(widget, (QLineEdit, QSlider, QAbstractButton)):
+                return True
+            widget = widget.parentWidget()
+        return False
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.MouseButtonPress and isinstance(watched, QWidget):
+            focused = self.focusWidget()
+            if focused is not None and not self._is_focus_preserving_widget(watched):
+                focused.clearFocus()
+                self.setFocus(Qt.MouseFocusReason)
+        return super().eventFilter(watched, event)
 
     def _band_label(self, frequency: float) -> str:
         if frequency >= 1000:
@@ -146,5 +178,11 @@ class EqProfileDialog(QDialog):
         name = self.name_edit.text().strip() or self._source_profile.name
         bands: list[EqBand] = []
         for old_band, slider in zip(self._source_profile.bands, self.band_sliders, strict=False):
-            bands.append(EqBand(frequency=old_band.frequency, gain_db=float(slider.value()), q=old_band.q))
+            bands.append(
+                EqBand(
+                    frequency=float(slider.frequency()),
+                    gain_db=float(slider.value()),
+                    q=old_band.q,
+                )
+            )
         return EqProfile(name=name, bands=bands)

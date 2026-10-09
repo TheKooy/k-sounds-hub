@@ -125,3 +125,6 @@ SHA256SUMS.txt
 *.aab
 *.jks
 *.keystore
+
+# Locally compiled helper binaries
+/bin/

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
+from ._version import __version__
+
 def _env_path(name: str, default: Path) -> Path:
     value = os.environ.get(name, "").strip()
     return Path(value).expanduser() if value else default
@@ -10,7 +12,7 @@ def _env_path(name: str, default: Path) -> Path:
 _profile_suffix = os.environ.get("KSH_PROFILE_SUFFIX", "").strip()
 _default_app_name = "K-Sounds Hub" + (f" {_profile_suffix}" if _profile_suffix else "")
 APP_NAME = os.environ.get("KSH_APP_NAME", _default_app_name)
-APP_VERSION = "0.3.4"
+APP_VERSION = __version__
 ORG_NAME = os.environ.get("KSH_ORG_NAME", APP_NAME)
 ORG_DOMAIN = os.environ.get("KSH_ORG_DOMAIN", "local.ksoundshub")
 
@@ -53,12 +55,14 @@ DEFAULT_CHANNELS = [
 ]
 
 DEFAULT_EQ_BANDS = [
-    {"frequency": 60.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 170.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 310.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 600.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 32.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 64.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 125.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 250.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 500.0, "gain_db": 0.0, "q": 1.0},
     {"frequency": 1000.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 3000.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 6000.0, "gain_db": 0.0, "q": 1.0},
-    {"frequency": 12000.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 2000.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 4000.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 8000.0, "gain_db": 0.0, "q": 1.0},
+    {"frequency": 16000.0, "gain_db": 0.0, "q": 1.0},
 ]

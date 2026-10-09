@@ -1,0 +1,37 @@
+{
+  "id": "voice_fx",
+  "name": "Voice FX",
+  "version": "1.2.0",
+  "ksounds_api": 1,
+  "description": "Native voice effects, playful built-in FX and ordered creative DSP blocks in the portable Custom Preset Lab.",
+  "provides": [
+    "ui.vfx",
+    "audio.vfx",
+    "preset.vfx",
+    "remote.vfx"
+  ],
+  "optional_dependencies": [
+    "remote"
+  ],
+  "runtimes": [
+    "audio.micro"
+  ],
+  "nav_label": "VFX",
+  "nav_icon": "✹",
+  "nav_order": 40,
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/voice_fx/module.json",
+    "src/ksound_hub/voice_fx_ui.py",
+    "src/ksound_hub/dsp_registry.py",
+    "src/ksound_hub/preset_engine.py",
+    "src/ksound_hub/preset_lab_ui.py",
+    "docs/VOICE_FX.md",
+    "native_engine/src/voice_fx_dsp.cpp",
+    "native_engine/src/voice_fx_dsp.hpp"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/glass_app.py",
+    "src/ksound_hub/models.py"
+  ]
+}

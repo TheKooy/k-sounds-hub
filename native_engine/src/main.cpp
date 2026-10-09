@@ -1,12 +1,21 @@
 #include "engine.hpp"
 
 #include <iostream>
+#include <csignal>
 #include <stdexcept>
 #include <string>
+#include <sys/prctl.h>
+#include <unistd.h>
 
 using namespace ksound::native;
 
 int main(int argc, char** argv) {
+    const pid_t owner_pid = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != owner_pid) {
+        std::cerr << "Unable to bind native playback lifetime to its owner\n";
+        return 1;
+    }
+
     EngineConfig config;
 
     for (int i = 1; i < argc; ++i) {

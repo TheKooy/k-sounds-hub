@@ -9,7 +9,7 @@ pwd
 echo
 
 echo "===== CORE COMMANDS ====="
-for cmd in python pip pactl parec pw-cat ffmpeg; do
+for cmd in python3 pactl parec pw-cat ffmpeg cmake c++; do
   if command -v "$cmd" >/dev/null 2>&1; then
     printf '%-10s %s\n' "$cmd" "$(command -v "$cmd")"
   else
@@ -38,3 +38,21 @@ for mod in mods:
     except Exception as exc:
         print(f"{mod}: MISSING ({exc.__class__.__name__}: {exc})")
 PY
+
+echo
+echo "===== RUNTIME COMPONENTS ====="
+components=(
+  "native playback|$REPO_DIR/native_engine/build/ksound_native_engine"
+  "native Micro|$REPO_DIR/native_engine/build/ksound_native_micro_engine"
+  "native meters|$REPO_DIR/native_engine/build/ksound_native_meter_engine"
+  "Wayland HUD|$REPO_DIR/tools/hud_overlay/build/audio-hud-overlay"
+)
+for component in "${components[@]}"; do
+  label="${component%%|*}"
+  path="${component#*|}"
+  if [[ -x "$path" ]]; then
+    printf '%-18s OK (%s)\n' "$label" "$path"
+  else
+    printf '%-18s missing/optional (%s)\n' "$label" "$path"
+  fi
+done

@@ -1,0 +1,27 @@
+{
+  "id": "eq",
+  "name": "EQ",
+  "version": "1.0.0",
+  "ksounds_api": 1,
+  "description": "Output and MICRO equalizer pages and presets.",
+  "provides": [
+    "ui.eq",
+    "audio.eq",
+    "preset.eq"
+  ],
+  "nav_label": "EQ",
+  "nav_icon": "≋",
+  "nav_order": 20,
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/eq/module.json",
+    "src/ksound_hub/builtin_modules/eq/runtime.py",
+    "src/ksound_hub/builtin_modules/eq/lifecycle.py"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/audio/pipewire.py",
+    "src/ksound_hub/audio/pipewire_v2_final.py",
+    "src/ksound_hub/glass_app.py",
+    "src/ksound_hub/models.py"
+  ]
+}

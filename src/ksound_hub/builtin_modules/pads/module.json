@@ -1,0 +1,30 @@
+{
+  "id": "pads",
+  "name": "Pads",
+  "version": "1.0.0",
+  "ksounds_api": 1,
+  "description": "Soundboard pads, folders and pad shortcuts.",
+  "provides": [
+    "ui.pads",
+    "audio.soundboard",
+    "remote.pads"
+  ],
+  "optional_dependencies": [
+    "remote"
+  ],
+  "runtimes": [
+    "soundboard"
+  ],
+  "nav_label": "Pads",
+  "nav_icon": "▦",
+  "nav_order": 50,
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/pads/module.json"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/glass_app.py",
+    "src/ksound_hub/soundboard_remote_runtime.py",
+    "tools/soundboard_remote/ksound_soundboard_web.py"
+  ]
+}

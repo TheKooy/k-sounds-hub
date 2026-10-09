@@ -156,9 +156,7 @@ mapfile -t JAVA_FILES < <(find "$APP_DIR/src" "$GEN_DIR" -type f -name '*.java' 
 
 javac \
   -encoding UTF-8 \
-  -source 8 \
-  -target 8 \
-  -bootclasspath "$ANDROID_JAR" \
+  --release 8 \
   -classpath "$ANDROID_JAR" \
   -d "$CLASSES_DIR" \
   "${JAVA_FILES[@]}"

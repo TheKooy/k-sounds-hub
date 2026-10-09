@@ -1,0 +1,30 @@
+{
+  "id": "micro_tune",
+  "name": "Micro Tune",
+  "version": "1.1.0",
+  "ksounds_api": 1,
+  "description": "MICRO Tune processing controls: input gain, RNNoise, smooth Gate, EQ and dynamics.",
+  "provides": [
+    "ui.tune",
+    "audio.micro_tune",
+    "preset.micro_tune"
+  ],
+  "runtimes": [
+    "audio.micro"
+  ],
+  "nav_label": "Tune",
+  "nav_icon": "◉",
+  "nav_order": 30,
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/micro_tune/module.json",
+    "src/ksound_hub/micro_processing_ui.py",
+    "native_engine/src/micro_tune_dsp.cpp",
+    "native_engine/src/micro_tune_dsp.hpp"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/audio/pipewire_v2_final.py",
+    "src/ksound_hub/glass_app.py",
+    "src/ksound_hub/models.py"
+  ]
+}

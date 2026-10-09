@@ -1,0 +1,22 @@
+{
+  "id": "remote",
+  "name": "Remote",
+  "version": "1.0.0",
+  "ksounds_api": 1,
+  "description": "One shared Remote server that exposes enabled module surfaces.",
+  "provides": [
+    "remote.server"
+  ],
+  "runtimes": [
+    "remote.server"
+  ],
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/remote/module.json"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/soundboard_remote_runtime.py",
+    "tools/soundboard_remote/ksound_soundboard_web.py",
+    "src/ksound_hub/glass_app.py"
+  ]
+}

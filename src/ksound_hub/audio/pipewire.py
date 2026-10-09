@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -15,7 +16,24 @@ import numpy as np
 
 from ..config import CONFIG_DIR
 from ..models import AppSettings, ChannelConfig, EqProfile
+from ..builtin_modules.eq.runtime import (
+    EqRuntimeSlot,
+    build_eq_slot_signature as _module_build_eq_slot_signature,
+    build_eq_slot_status as _build_eq_slot_status,
+    render_eq_dropin as _module_render_eq_dropin,
+    stereo_width_matrix as _module_stereo_width_matrix,
+)
+from ..builtin_modules.eq.lifecycle import (
+    EQ_HOT_SWAP_DUCK_FACTOR as _MODULE_EQ_HOT_SWAP_DUCK_FACTOR,
+    EQ_HOT_SWAP_READY_POLL_SECONDS as _MODULE_EQ_HOT_SWAP_READY_POLL_SECONDS,
+    EQ_HOT_SWAP_READY_TIMEOUT_SECONDS as _MODULE_EQ_HOT_SWAP_READY_TIMEOUT_SECONDS,
+    EQ_PIPEWIRE_LATENCY as _MODULE_EQ_PIPEWIRE_LATENCY,
+    EqProcessLifecycle,
+    hot_swap_duck_volume as _module_hot_swap_duck_volume,
+)
 from .engine import AppStream, AudioEngine, AudioNode
+from ..audio_contract import STEREO
+from ..audio_safety import finite_guard_available, finite_guard_plugin_path
 
 
 TARGET_OBJECT_BY_LABEL: dict[str, str] = {}
@@ -62,16 +80,13 @@ METER_SOURCE_BY_CHANNEL = {
     "micro": "micro_bus.monitor",
 }
 
-EQ_PIPEWIRE_LATENCY = "256/48000"
-
-
-@dataclass
-class EqRuntimeSlot:
-    key: str
-    logical_sink: str
-    proc: subprocess.Popen | None = None
-    signature: str = ""
-    status: str = "idle"
+# 768 / 48000 is the current EQ/filter-chain latency test.
+# It is used to check whether rare random playback pops improve.
+# Compatibility aliases. The EQ module owns the lifecycle constants.
+EQ_PIPEWIRE_LATENCY = _MODULE_EQ_PIPEWIRE_LATENCY
+EQ_HOT_SWAP_DUCK_FACTOR = _MODULE_EQ_HOT_SWAP_DUCK_FACTOR
+EQ_HOT_SWAP_READY_TIMEOUT_SECONDS = _MODULE_EQ_HOT_SWAP_READY_TIMEOUT_SECONDS
+EQ_HOT_SWAP_READY_POLL_SECONDS = _MODULE_EQ_HOT_SWAP_READY_POLL_SECONDS
 
 
 @dataclass
@@ -99,6 +114,11 @@ class SinkInputBlock:
 
 def _clamp_int(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, int(value)))
+
+
+def _eq_hot_swap_duck_volume(base_volume: int) -> int:
+    """Compatibility bridge into the EQ module-owned lifecycle."""
+    return _module_hot_swap_duck_volume(base_volume)
 
 
 def _parse_short_audio_nodes(lines: Iterable[str], kind: str) -> list[AudioNode]:
@@ -179,6 +199,29 @@ def _parse_sink_input_blocks(lines: Iterable[str]) -> list[SinkInputBlock]:
 class PlaybackTarget:
     label: str
     sink_name: str
+
+
+def _build_eq_slot_signature(
+    key: str,
+    profile: EqProfile,
+    target: PlaybackTarget,
+    stereo_width: int,
+) -> str:
+    """Compatibility bridge into the EQ module-owned runtime contract."""
+    return _module_build_eq_slot_signature(
+        key=key,
+        profile=profile,
+        target_label=target.label,
+        target_sink=target.sink_name,
+        stereo_width=stereo_width,
+        layout=STEREO,
+        finite_guard_active=finite_guard_available(),
+    )
+
+
+def _stereo_width_matrix(stereo_width: int) -> tuple[float, float]:
+    """Compatibility bridge; implementation is owned by the EQ module."""
+    return _module_stereo_width_matrix(stereo_width)
 
 
 def _resolved_channel_node_volume(channel_volume: int, *, node_type: str, node_name: str) -> int:
@@ -275,30 +318,18 @@ def _build_stream_display_name(block: SinkInputBlock) -> str | None:
     return base
 
 
-def _build_eq_slot_signature(key: str, profile: EqProfile, target: PlaybackTarget) -> str:
-    return json.dumps(
-        {
-            "key": key,
-            "profile": profile.to_dict(),
-            "target_label": target.label,
-            "target_sink": target.sink_name,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
-    )
 
 
-def _build_eq_slot_status(*, profile_name: str, target_label: str, muted: bool, volume: int) -> str:
-    extra: list[str] = []
-    if muted:
-        extra.append("muted")
-    elif volume != 100:
-        extra.append(f"vol {volume}%")
-    suffix = f" • {', '.join(extra)}" if extra else ""
-    return f"active ({profile_name} → {target_label}){suffix}"
+
+
 
 
 class SourceMeterProbe:
+    # Process-wide guard: after suspend/resume or UI rebuilds, old meter
+    # threads must not keep spawning duplicate parec clients for the same source.
+    _active_lock = threading.Lock()
+    _active_by_source: dict[str, "SourceMeterProbe"] = {}
+
     def __init__(self, source_name: str) -> None:
         self.source_name = source_name
         self._stop_event = threading.Event()
@@ -312,6 +343,19 @@ class SourceMeterProbe:
         )
 
     def start(self) -> None:
+        previous: SourceMeterProbe | None = None
+
+        with SourceMeterProbe._active_lock:
+            current = SourceMeterProbe._active_by_source.get(self.source_name)
+            if current is not None and current is not self:
+                previous = current
+                previous._stop_event.set()
+                previous._terminate_proc()
+            SourceMeterProbe._active_by_source[self.source_name] = self
+
+        if previous is not None:
+            previous.stop()
+
         if not self._thread.is_alive():
             self._thread.start()
 
@@ -320,6 +364,11 @@ class SourceMeterProbe:
         self._terminate_proc()
         if self._thread.is_alive():
             self._thread.join(timeout=1.2)
+
+        with SourceMeterProbe._active_lock:
+            if SourceMeterProbe._active_by_source.get(self.source_name) is self:
+                SourceMeterProbe._active_by_source.pop(self.source_name, None)
+
         self._set_levels(0.0, 0.0)
 
     def levels(self) -> tuple[float, float]:
@@ -348,13 +397,13 @@ class SourceMeterProbe:
             pass
 
     def _run(self) -> None:
-        # 960 frames @ 48 kHz ~= 20 ms.
-        # This probe is UI-only, not audio-path. The UI refreshes meters at a
-        # much lower rate, so avoid 5 ms polling that burns CPU during games.
-        # Old buffered data is still dropped so the meter stays current.
-        chunk_frames = 960
+        # UI-only meter probe, not audio-path. Keep it deliberately cheap:
+        # 2400 frames @ 48 kHz ~= 50 ms, while Glass refreshes at ~8 Hz.
+        # Old buffered data is dropped so the meter stays current without
+        # burning a CPU core during games.
+        chunk_frames = 2400
         chunk_bytes = chunk_frames * 2 * 4
-        max_buffer_bytes = chunk_bytes * 4
+        max_buffer_bytes = chunk_bytes * 2
 
         while not self._stop_event.is_set():
             current_left = 0.0
@@ -393,9 +442,9 @@ class SourceMeterProbe:
 
                     got_data = False
 
-                    # Drain all immediately available data. This prevents the UI
-                    # from displaying old chunks when PipeWire/Qt had a short hiccup.
-                    for _ in range(32):
+                    # Drain only a small amount per pass. This prevents a hot
+                    # Python loop when audio is continuously available.
+                    for _ in range(4):
                         try:
                             data = os.read(fd, 65536)
                         except BlockingIOError:
@@ -427,14 +476,15 @@ class SourceMeterProbe:
                             peak_left = float(np.max(np.abs(frames[:, 0])))
                             peak_right = float(np.max(np.abs(frames[:, 1])))
 
-                            current_left = max(min(1.0, peak_left), current_left * 0.62)
-                            current_right = max(min(1.0, peak_right), current_right * 0.62)
+                            current_left = max(min(1.0, peak_left), current_left * 0.55)
+                            current_right = max(min(1.0, peak_right), current_right * 0.55)
                             self._set_levels(current_left, current_right)
 
+                        time.sleep(0.035)
                         continue
 
-                    current_left *= 0.78
-                    current_right *= 0.78
+                    current_left *= 0.70
+                    current_right *= 0.70
 
                     if current_left < 0.002:
                         current_left = 0.0
@@ -442,7 +492,7 @@ class SourceMeterProbe:
                         current_right = 0.0
 
                     self._set_levels(current_left, current_right)
-                    time.sleep(0.012)
+                    time.sleep(0.05)
 
             except Exception:
                 self._set_levels(0.0, 0.0)
@@ -453,6 +503,10 @@ class SourceMeterProbe:
             if not self._stop_event.is_set():
                 time.sleep(0.08)
 
+        with SourceMeterProbe._active_lock:
+            if SourceMeterProbe._active_by_source.get(self.source_name) is self:
+                SourceMeterProbe._active_by_source.pop(self.source_name, None)
+
         self._set_levels(0.0, 0.0)
 
 
@@ -460,12 +514,33 @@ class PipeWireAudioEngine(AudioEngine):
     def __init__(self) -> None:
         self.runtime_dir = CONFIG_DIR / "runtime"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._eq_lifecycle = EqProcessLifecycle(
+            runtime_dir=self.runtime_dir,
+            playback_stream_ids=self._eq_playback_stream_ids,
+            set_sink_volume=lambda node_name, volume: self._set_node_volume_raw(
+                node_type="sink", node_name=node_name, volume=volume
+            ),
+            ladspa_paths=(finite_guard_plugin_path().parent,),
+        )
+        self._cleanup_stale_eq_filter_chain_processes()
+
 
         self.eq_slots: dict[str, EqRuntimeSlot] = {
             key: EqRuntimeSlot(key=key, logical_sink=logical_sink)
             for key, logical_sink in PLAYBACK_EQ_CHANNELS.items()
         }
+        self._cleanup_stale_meter_parec_processes()
         self._meter_probes: dict[str, SourceMeterProbe] = {}
+        self._native_meter_runtime_dir = self.runtime_dir / "native-meter-engine"
+        self._native_meter_runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._native_meter_levels_path = self._native_meter_runtime_dir / "levels.json"
+        self._native_meter_log_path = self._native_meter_runtime_dir / "native-meter-engine.log"
+        self._native_meter_proc: subprocess.Popen | None = None
+        self._native_meter_shutting_down = False
+        self._native_meter_levels_cache_mtime_ns = 0
+        self._native_meter_levels_cache_payload: dict[str, object] = {}
+        self._native_meter_levels_last_poll_at = 0.0
+        self._native_meter_levels_last_seen_at = 0.0
         self._meter_source_name_cache: set[str] = set()
         self._meter_source_cache_at = 0.0
         self._micro_links: dict[str, LoopbackLink] = {}
@@ -483,6 +558,29 @@ class PipeWireAudioEngine(AudioEngine):
             self._run(args)
         except Exception:
             pass
+
+    def _cleanup_stale_meter_parec_processes(self) -> None:
+        # Old native meter engines can survive a killed Glass process, suspend,
+        # or a session restore. Each orphan can spawn one parec per channel and
+        # exhaust pipewire-pulse client slots, making real devices look missing.
+        native_pattern = r"ksound_native_meter_engine --levels .*/native-meter-engine/levels\.json"
+        parec_pattern = (
+            r"parec --device=(all|game|chat|media|more|retour|micro|micro_bus|soundboard)\.monitor "
+            r"--raw --format=float32le --rate=48000 --channels=2 --latency-msec=(25|40|80)"
+        )
+        for signal_name in ("-TERM", "-KILL"):
+            for pattern in (native_pattern, parec_pattern):
+                try:
+                    subprocess.run(
+                        ["pkill", signal_name, "-f", pattern],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+            if signal_name == "-TERM":
+                time.sleep(0.2)
 
     def _pw_link_available(self) -> bool:
         return shutil.which("pw-link") is not None
@@ -537,48 +635,184 @@ class PipeWireAudioEngine(AudioEngine):
         return " • ".join(parts)
 
     def shutdown(self) -> None:
-        for slot in self.eq_slots.values():
-            self._stop_slot(slot)
+        self._native_meter_shutting_down = True
+        # Native meters live in their own process group/session. Stop them first
+        # so later audio teardown cannot strand them in KDE's systemd app scope.
         self.stop_meter_probes()
-        for key in list(self._micro_links):
-            self._unload_micro_link(key)
-        self._disable_return_mic()
+        try:
+            for slot in self.eq_slots.values():
+                self._stop_slot(slot)
+            for key in list(self._micro_links):
+                self._unload_micro_link(key)
+            self._disable_return_mic()
+        finally:
+            # Backstop for a meter left by an interrupted/crashed earlier owner.
+            self._cleanup_stale_meter_parec_processes()
+
+    def _native_meter_engine_binary(self) -> Path:
+        return Path(__file__).resolve().parents[3] / "native_engine" / "build" / "ksound_native_meter_engine"
+
+    def _stop_native_meter_engine(self) -> None:
+        proc = self._native_meter_proc
+        self._native_meter_proc = None
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=1.5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                        try:
+                            proc.wait(timeout=1.0)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        self._native_meter_levels_cache_mtime_ns = 0
+        self._native_meter_levels_cache_payload = {}
+        self._native_meter_levels_last_poll_at = 0.0
+        self._native_meter_levels_last_seen_at = 0.0
+        try:
+            self._native_meter_levels_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _ensure_native_meter_engine(self) -> bool:
+        if getattr(self, "_native_meter_shutting_down", False):
+            return False
+
+        binary = self._native_meter_engine_binary()
+        if not binary.is_file():
+            return False
+
+        if self._native_meter_proc is not None and self._native_meter_proc.poll() is None:
+            return True
+
+        self._stop_native_meter_engine()
+        self._native_meter_runtime_dir.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            str(binary),
+            "--levels",
+            str(self._native_meter_levels_path),
+            "--log",
+            str(self._native_meter_log_path),
+            "--period-ms",
+            "30",
+        ]
+
+        for key, source_name in METER_SOURCE_BY_CHANNEL.items():
+            args.extend(["--source", f"{key}={source_name}"])
+
+        env = os.environ.copy()
+        env["KSH_RUNTIME_ROLE"] = "native_meter_engine"
+
+        log_file = self._native_meter_log_path.open("ab", buffering=0)
+        try:
+            self._native_meter_proc = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        except Exception:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+            self._native_meter_proc = None
+            return False
+
+        return self._native_meter_proc is not None and self._native_meter_proc.poll() is None
+
+    def _read_native_meter_levels_payload(self) -> dict:
+        now = time.monotonic()
+        cache = self._native_meter_levels_cache_payload
+        cache_is_fresh = (
+            isinstance(cache, dict)
+            and self._native_meter_levels_last_seen_at > 0.0
+            and now - self._native_meter_levels_last_seen_at <= 0.25
+        )
+
+        # meter_levels() is called once per visible channel in the same UI tick.
+        # Poll/stat and JSON-decode at most once for that whole frame.
+        if now - self._native_meter_levels_last_poll_at < 0.02:
+            return cache if cache_is_fresh else {}
+        self._native_meter_levels_last_poll_at = now
+
+        try:
+            stat = self._native_meter_levels_path.stat()
+            mtime_ns = int(stat.st_mtime_ns)
+            if mtime_ns == self._native_meter_levels_cache_mtime_ns:
+                return cache if cache_is_fresh else {}
+
+            payload = json.loads(self._native_meter_levels_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+
+            self._native_meter_levels_cache_mtime_ns = mtime_ns
+            self._native_meter_levels_cache_payload = payload
+            self._native_meter_levels_last_seen_at = now
+            return payload
+        except Exception:
+            return cache if cache_is_fresh else {}
+
+    def _native_meter_levels(self, channel_key: str) -> tuple[float, float] | None:
+        if not self._ensure_native_meter_engine():
+            return None
+
+        payload = self._read_native_meter_levels_payload()
+        channels = payload.get("channels") if isinstance(payload, dict) else None
+        if not isinstance(channels, dict):
+            return (0.0, 0.0)
+
+        levels = channels.get(channel_key)
+        if not (isinstance(levels, list) and len(levels) >= 2):
+            return (0.0, 0.0)
+
+        try:
+            return (
+                max(0.0, min(1.0, float(levels[0]))),
+                max(0.0, min(1.0, float(levels[1]))),
+            )
+        except Exception:
+            return (0.0, 0.0)
 
     def stop_meter_probes(self) -> None:
-        """Stop UI-only meter capture processes.
+        """Stop the optional UI-only meter module and all its captures."""
 
-        Meters are visual only. When the UI is hidden/minimized or meters are
-        disabled, keeping parec probes alive wastes CPU during games.
-        """
-
+        self._stop_native_meter_engine()
         for probe in list(self._meter_probes.values()):
             probe.stop()
         self._meter_probes.clear()
 
     def _log_path_for(self, key: str) -> Path:
-        return self.runtime_dir / f"{key}-eq.log"
+        return self._eq_lifecycle.log_path_for(key)
 
     def _xdg_home_for(self, key: str) -> Path:
-        return self.runtime_dir / f"{key}-eq-xdg"
+        return self._eq_lifecycle.xdg_home_for(key)
 
     def _dropin_path_for(self, key: str) -> Path:
-        return self._xdg_home_for(key) / "pipewire" / "filter-chain.conf.d" / f"ksound-{key}-eq.conf"
+        return self._eq_lifecycle.dropin_path_for(key)
+
+    def _terminate_eq_process(self, proc) -> None:
+        self._eq_lifecycle.terminate_process(proc)
 
     def _stop_slot(self, slot: EqRuntimeSlot) -> None:
-        proc = slot.proc
-        slot.proc = None
-        slot.signature = ""
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        except Exception:
-            pass
+        self._eq_lifecycle.stop_slot(slot)
+
+    def _cleanup_stale_eq_filter_chain_processes(self) -> None:
+        self._eq_lifecycle.cleanup_stale_filter_chain_processes()
 
     def _find_channel(self, settings: AppSettings, key: str) -> ChannelConfig | None:
         for channel in settings.channels:
@@ -596,6 +830,12 @@ class PipeWireAudioEngine(AudioEngine):
     def _sink_exists(self, sink_name: str) -> bool:
         return any(node.name == sink_name for node in self.list_sinks())
 
+    def _sink_is_running(self, sink_name: str) -> bool:
+        return any(
+            node.name == sink_name and str(getattr(node, "state", "")).strip().upper() == "RUNNING"
+            for node in self.list_sinks()
+        )
+
     def _source_exists(self, source_name: str) -> bool:
         return any(node.name == source_name for node in self.list_sources())
 
@@ -605,6 +845,22 @@ class PipeWireAudioEngine(AudioEngine):
     def _internal_source_names(self) -> set[str]:
         return {"micro"}
 
+    def _is_valid_micro_input_source_name(self, source_name: str) -> bool:
+        """Return whether a source can safely feed the exported MICRO bus.
+
+        ``micro`` is the K-Sounds virtual output. Feeding it back into
+        ``micro_bus`` creates a self-loop. Monitor sources are internal mix
+        taps and must be added through the explicit MICRO injection controls,
+        never through the physical microphone selector.
+        """
+        name = str(source_name or "").strip()
+        return bool(
+            name
+            and name not in self._internal_source_names()
+            and not name.endswith(".monitor")
+            and ".monitor" not in name
+        )
+
     def _physical_sink_names(self) -> list[str]:
         internal = self._internal_sink_names()
         names = [node.name for node in self.list_sinks()]
@@ -612,15 +868,12 @@ class PipeWireAudioEngine(AudioEngine):
         return physical or names
 
     def _physical_source_names(self) -> list[str]:
-        internal = self._internal_source_names()
         names = [node.name for node in self.list_sources()]
         physical = [
             name for name in names
-            if name not in internal
-            and ".monitor" not in name
-            and not name.endswith(".monitor")
+            if self._is_valid_micro_input_source_name(name)
         ]
-        return physical or [name for name in names if name not in internal] or names
+        return physical
 
     def _default_playback_sink_name(self) -> str:
         proc = self._run(["pactl", "get-default-sink"])
@@ -643,30 +896,31 @@ class PipeWireAudioEngine(AudioEngine):
     def _default_micro_source_name(self) -> str:
         proc = self._run(["pactl", "get-default-source"])
         default = proc.stdout.strip() if proc.returncode == 0 else ""
-        internal = self._internal_source_names()
 
         if (
             default
-            and default not in internal
-            and ".monitor" not in default
+            and self._is_valid_micro_input_source_name(default)
             and self._source_exists(default)
         ):
             return default
 
         for name in self._physical_source_names():
-            if name and name not in internal and ".monitor" not in name and self._source_exists(name):
+            if self._is_valid_micro_input_source_name(name) and self._source_exists(name):
                 return name
 
-        if default and self._source_exists(default):
-            return default
-
-        sources = self.list_sources()
-        return sources[0].name if sources else ""
+        return ""
 
     def _resolved_micro_source_name(self, channel: ChannelConfig) -> str:
         wanted = (channel.primary_target or "").strip()
-        if wanted and self._source_exists(wanted):
-            return wanted
+
+        # Fail closed for an explicitly selected microphone. If that hardware
+        # disappears, never silently capture another physical/default source.
+        if wanted:
+            if self._is_valid_micro_input_source_name(wanted) and self._source_exists(wanted):
+                return wanted
+            return ""
+
+        # An empty/unconfigured selector may still resolve to the system default.
         return self._default_micro_source_name()
 
     def _resolved_micro_source_names(self, channel: ChannelConfig) -> list[str]:
@@ -680,95 +934,55 @@ class PipeWireAudioEngine(AudioEngine):
             return self._source_exists(node_name)
         return False
 
-    def _render_filters(self, profile: EqProfile) -> str:
-        lines = []
-        for band in profile.bands:
-            lines.append(
-                f'{{ type = bq_peaking freq = {band.frequency:.1f} gain = {band.gain_db:.2f} q = {band.q:.3f} }}'
-            )
-        return "\n          ".join(lines)
 
-    def _render_eq_dropin(self, *, key: str, logical_sink: str, profile: EqProfile, target_sink: str) -> str:
-        filters = self._render_filters(profile)
-        title = key.upper()
-        return f'''context.modules = [
-  {{
-    name = libpipewire-module-filter-chain
-    args = {{
-      node.description = "K-Sound Hub {title} EQ"
-      media.name = "K-Sound Hub {title} EQ"
-      filter.graph = {{
-        nodes = [
-          {{
-            type = builtin
-            name = eq
-            label = param_eq
-            config = {{
-              filters = [
-          {filters}
-              ]
-            }}
-          }}
-        ]
-        inputs  = [ "eq:In 1"  "eq:In 2" ]
-        outputs = [ "eq:Out 1" "eq:Out 2" ]
-      }}
-      capture.props = {{
-        node.name = "ksh_{key}_eq.capture"
-        target.object = "{logical_sink}"
-        stream.capture.sink = true
-        node.passive = true
-        node.dont-reconnect = true
-        audio.channels = 2
-        audio.position = [ FL FR ]
-      }}
-      playback.props = {{
-        node.name = "ksh_{key}_eq.playback"
-        target.object = "{target_sink}"
-        node.passive = true
-        node.dont-reconnect = true
-        audio.channels = 2
-        audio.position = [ FL FR ]
-      }}
-    }}
-  }}
-]
-'''
+
+    def _render_eq_dropin(
+        self,
+        *,
+        key: str,
+        logical_sink: str,
+        profile: EqProfile,
+        target_sink: str,
+        stereo_width: int,
+    ) -> str:
+        """Delegate filter-chain rendering to the EQ module-owned runtime."""
+        return _module_render_eq_dropin(
+            key=key,
+            logical_sink=logical_sink,
+            profile=profile,
+            target_sink=target_sink,
+            stereo_width=stereo_width,
+            layout=STEREO,
+            finite_guard_active=finite_guard_available(),
+        )
 
     def _write_slot_dropin(self, key: str, text: str) -> None:
-        path = self._dropin_path_for(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        self._eq_lifecycle.write_slot_dropin(key, text)
 
-    def _start_slot(self, slot: EqRuntimeSlot, signature: str) -> None:
-        if slot.proc is not None and slot.signature == signature and slot.proc.poll() is None:
-            return
+    def _eq_playback_stream_ids(self, key: str) -> set[int]:
+        proc = self._run(["pactl", "list", "sink-inputs"])
+        if proc.returncode != 0:
+            return set()
+        node_name = f"ksh_{key}_eq.playback"
+        media_name = f"K-Sound Hub {key.upper()} EQ"
+        return {
+            int(block.sink_input_id)
+            for block in _parse_sink_input_blocks(proc.stdout.splitlines())
+            if block.sink_input_id is not None
+            and (block.node_name == node_name or block.media_name == media_name)
+        }
 
-        self._stop_slot(slot)
+    def _spawn_eq_process(self, slot: EqRuntimeSlot):
+        return self._eq_lifecycle.spawn_process(slot)
 
-        env = os.environ.copy()
-        env["XDG_CONFIG_HOME"] = str(self._xdg_home_for(slot.key))
-        env["LC_ALL"] = "C"
-        env["PIPEWIRE_LATENCY"] = EQ_PIPEWIRE_LATENCY
+    def _wait_for_eq_playback_stream(self, key: str, previous_ids: set[int], new_proc) -> bool:
+        return self._eq_lifecycle.wait_for_playback_stream(key, previous_ids, new_proc)
 
-        with self._log_path_for(slot.key).open("ab", buffering=0) as log_file:
-            slot.proc = subprocess.Popen(
-                ["pipewire", "-c", "filter-chain.conf"],
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
-        slot.signature = signature
+    def _start_slot(self, slot: EqRuntimeSlot, signature: str, *, handover_volume: int = 0) -> None:
+        self._eq_lifecycle.start_slot(slot, signature, handover_volume=handover_volume)
 
     def _read_slot_log_tail(self, key: str) -> str:
-        log_path = self._log_path_for(key)
-        if not log_path.is_file():
-            return ""
-        try:
-            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
-            return ""
-        return lines[-1].strip() if lines else ""
+        return self._eq_lifecycle.read_log_tail(key)
 
     def _read_node_volume_percent(self, *, node_type: str, node_name: str) -> int | None:
         cmd = ["pactl", f"get-{node_type}-volume", node_name]
@@ -869,7 +1083,15 @@ class PipeWireAudioEngine(AudioEngine):
             self._run_no_fail(["pactl", "set-sink-mute", "micro_bus", muted])
 
         if self._source_exists("micro"):
-            self._run_no_fail(["pactl", "set-source-volume", "micro", "100%"])
+            # Discord/Steam/etc. capture the exported virtual source named
+            # "micro". Apply the user-facing MICRO volume here so the app gets
+            # the same level the UI slider shows.
+            exported_volume = _resolved_channel_node_volume(
+                channel.volume,
+                node_type="source",
+                node_name="micro",
+            )
+            self._run_no_fail(["pactl", "set-source-volume", "micro", f"{exported_volume}%"])
             self._run_no_fail(["pactl", "set-source-mute", "micro", muted])
 
     def _unload_micro_link(self, channel_key: str) -> None:
@@ -1055,8 +1277,7 @@ class PipeWireAudioEngine(AudioEngine):
                 is_legacy = (
                     "K-Sound Hub Mic Physical" in args
                     or "K-Sounds Hub Mic Physical" in args
-                    or "KSH_MIC_PHYSICAL_RODE" in args
-                    or "KSH_MIC_PHYSICAL_ANPW" in args
+                    or "KSH_MIC_PHYSICAL_" in args
                 )
                 if is_legacy:
                     legacy_ids.append(module_id)
@@ -1372,7 +1593,12 @@ class PipeWireAudioEngine(AudioEngine):
             node_names = [self._resolved_micro_source_name(channel)]
 
         for node_name in node_names:
-            self._apply_node_controls(channel, node_type="source", node_name=node_name)
+            # Keep the selected input source at unity. The MICRO slider controls
+            # the exported K-Sounds virtual mic, not the physical/EasyEffects
+            # input node directly.
+            if self._source_exists(node_name):
+                self._run_no_fail(["pactl", "set-source-volume", node_name, "100%"])
+                self._run_no_fail(["pactl", "set-source-mute", node_name, "0"])
 
         self._ensure_physical_micro_loopbacks(channel)
         self._run_no_fail(["pactl", "set-default-source", "micro"])
@@ -1404,7 +1630,12 @@ class PipeWireAudioEngine(AudioEngine):
             slot.status = f"{key.upper()} channel missing"
             return
 
-        self._apply_node_controls(channel, node_type="sink", node_name=logical_sink)
+        # MIC OUT has a single user-controlled gain/mute stage: its final
+        # RETURN-MIC EQ playback stream. Setting gain/mute on "retour" here
+        # introduces a second gain stage and can reopen the capture bus before
+        # the monitor's safety interlock has muted the final output.
+        if key != "return-mic":
+            self._apply_node_controls(channel, node_type="sink", node_name=logical_sink)
 
         if not channel.enabled:
             self._stop_slot(slot)
@@ -1433,10 +1664,18 @@ class PipeWireAudioEngine(AudioEngine):
             logical_sink=logical_sink,
             profile=profile,
             target_sink=target.sink_name,
+            stereo_width=channel.stereo_width,
         )
-        signature = _build_eq_slot_signature(key, profile, target)
+        signature = _build_eq_slot_signature(key, profile, target, channel.stereo_width)
         self._write_slot_dropin(key, dropin_text)
-        self._start_slot(slot, signature)
+        handover_volume = 0
+        if key != "return-mic" and not bool(channel.muted) and self._sink_is_running(logical_sink):
+            handover_volume = _resolved_channel_node_volume(
+                channel.volume,
+                node_type="sink",
+                node_name=logical_sink,
+            )
+        self._start_slot(slot, signature, handover_volume=handover_volume)
 
         proc = slot.proc
         if proc is None:
@@ -1460,20 +1699,19 @@ class PipeWireAudioEngine(AudioEngine):
         if not source_name:
             return (0.0, 0.0)
 
-        probe = self._meter_probes.get(channel_key)
-        if probe is not None:
-            if probe.source_name == source_name:
-                return probe.levels()
-            probe.stop()
-            self._meter_probes.pop(channel_key, None)
+        # Prefer the native meter engine. Do not fall back to legacy parec
+        # probes anymore: after suspend/resume or UI rebuilds, those probes can
+        # multiply until pipewire-pulse refuses new client connections, which
+        # makes real sources such as easyeffects_source look "not found".
+        native = self._native_meter_levels(channel_key)
+        if native is not None:
+            return native
 
-        if source_name not in self._cached_source_names():
-            return (0.0, 0.0)
+        # Defensive cleanup in case an older runtime left legacy probes alive.
+        if getattr(self, "_meter_probes", None):
+            self.stop_meter_probes()
 
-        probe = SourceMeterProbe(source_name)
-        probe.start()
-        self._meter_probes[channel_key] = probe
-        return probe.levels()
+        return (0.0, 0.0)
 
     def apply_channel(self, settings: AppSettings, channel_key: str) -> None:
         if channel_key in PLAYBACK_EQ_CHANNELS:

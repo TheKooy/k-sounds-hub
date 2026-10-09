@@ -1,6 +1,6 @@
 # K-Sounds Hub
 
-K-Sounds Hub is a PipeWire-first modular Linux audio hub.
+K-Sounds Hub is a PipeWire-first modular Linux audio hub. Glass is its official desktop frontend.
 
 It provides a focused desktop GUI for Linux audio routing, per-channel control, persistent settings, optional overlay feedback, IPC control shortcuts, live level meters, and PipeWire-based app routing helpers.
 
@@ -8,7 +8,9 @@ This project is being developed with AI assistance.
 
 ## Status
 
-Current version: 0.4.1
+Current public version: 0.4.7
+
+Latest Linux release: v0.4.7
 
 Main tested environment:
 
@@ -31,6 +33,8 @@ Other major Linux distributions are supported on a best-effort basis through the
 - optional wallpaper/background styling
 - tray-capable close behavior
 - optional Android soundboard remote source
+- native MICRO processing foundation: hard gate, input gain, compressor, de-esser and final limiter
+- Android Remote updater with signed in-place updates through public GitHub release assets
 
 ## Recommended user installation
 
@@ -41,15 +45,15 @@ Important:
 - Do not use the green Code button for normal installation.
 - Do not download the automatic Source code zip or Source code tar.gz files.
 - Download one of the release assets instead:
-  - k-sounds-hub-linux-release-v0.4.1.tar.gz
-  - k-sounds-hub-linux-release-v0.4.1.zip
+  - k-sounds-hub-linux-release-vX.Y.Z.tar.gz
+  - k-sounds-hub-linux-release-vX.Y.Z.zip
 
 ### Install from the tar.gz release
 
 Open a terminal in the folder where you downloaded the file, then run:
 
-    tar -xzf k-sounds-hub-linux-release-v0.4.1.tar.gz
-    cd k-sounds-hub-linux-release-v0.4.1
+    tar -xzf k-sounds-hub-linux-release-vX.Y.Z.tar.gz
+    cd k-sounds-hub-linux-release-vX.Y.Z
     ./install.sh
 
 Then start the app with:
@@ -60,8 +64,8 @@ Then start the app with:
 
 Open a terminal in the folder where you downloaded the file, then run:
 
-    unzip k-sounds-hub-linux-release-v0.4.1.zip
-    cd k-sounds-hub-linux-release-v0.4.1
+    unzip k-sounds-hub-linux-release-vX.Y.Z.zip
+    cd k-sounds-hub-linux-release-vX.Y.Z
     ./install.sh
 
 Then start the app with:
@@ -94,6 +98,18 @@ It does not:
 - enable autostart
 - write global PipeWire configuration
 - remove distro packages during uninstall
+- start EasyEffects automatically
+
+`k-sounds-hub` always opens Glass. The temporary classic frontend is available only through the explicit `k-sounds-hub-classic` command.
+
+The installer builds the native Micro and meter components by default and
+keeps an automatic Python/PipeWire fallback if the Micro binary cannot start.
+The experimental native playback engine remains disabled. The Wayland HUD is
+built on a best-effort basis unless `--require-hud` is requested.
+
+The Soundboard Remote server follows the Glass runtime and is not installed as
+a separate login service. A single health-checked manager owns its startup and
+shutdown.
 
 If required system dependencies are missing, the installer stops and tells you what is missing.
 
@@ -114,6 +130,9 @@ See docs/INSTALL.md for details.
 Remove saved config too:
 
     ~/.local/share/k-sounds-hub/app/uninstall.sh --remove-config
+
+Retired migration backups are kept by default and are removed only with the
+explicit `--purge-retired` option.
 
 ## Runtime dependencies
 
@@ -193,3 +212,27 @@ Current active development branch: feature/native-micro-engine
 ## Disclaimer
 
 K-Sounds Hub interacts with the user's Linux audio session through PipeWire/PulseAudio-compatible tools. It is intended to be non-destructive, but it is still audio-routing software. Review scripts before running them on important systems.
+
+## Soundboard Remote current state
+
+The Soundboard is shared by Glass, the PC detached window, the web Remote and the Android WebView through one non-UI service. Current development behavior includes bulk local imports, folders, URL/API banks, cached video thumbnails, automatic fallback colours, gradual Stop All, explicit Edit selection, atomic Remote restart/recovery and persistent pad/folder order.
+
+Remote gestures are intentionally touch-first: ordinary swipes scroll, pinch resizes the live grid up to 13 pads per row, normal-mode long-hold inserts a pad at the cyan drop line, and Edit mode uses explicit selection with `Swap selected` only when exactly two pads are selected. The optional `Resize outside Edit` setting enables pinch outside Edit without stealing one-finger scroll.
+
+Android is a thin native shell around the Remote UI. Most Remote visual changes are served by the PC and do not require a new APK. Native Android changes (pairing storage, display-rate handling, permissions, updater behavior) do require a rebuilt APK. The updater uses public GitHub Release assets and Android in-place installation so pairing is preserved.
+
+The Remote server is owned by the Glass runtime and supervised by a health-checked manager rather than a separate login service.
+
+## MICRO processing development
+
+The native MICRO engine is now the canonical physical-microphone path. Its product-facing processing chain is being built as:
+
+`Input Gain → Noise Suppression → Hard Gate → MICRO EQ → Compressor → De-esser → Voice FX → Limiter → MICRO`
+
+The current IP11a foundation implements Input Gain, the existing Hard Gate, Compressor, De-esser and a smooth final Limiter. Noise Suppression is intentionally shown as unavailable until the optional RNNoise backend is actually linked; K-Sounds does not pretend a generic filter is AI noise suppression. MICRO EQ and Voice FX remain follow-up stages.
+
+EasyEffects is still an optional external source during this migration. Do not remove it from an existing working setup until the native K-Sounds chain has been validated on that microphone. Disabled native processing blocks are real bypasses.
+
+### MICRO processing safety / A-B workflow
+
+The MICRO `FX` panel has a persistent master `Processing` bypass. It defaults OFF while the native chain is under validation. Settings can be prepared while bypassed, then enabled for immediate A/B comparison. The already-validated Hard Gate remains independent. EasyEffects may stay installed and available as a fallback source throughout migration/testing.

@@ -1,0 +1,25 @@
+{
+  "id": "hard_gate",
+  "name": "Hard Gate",
+  "version": "1.0.0",
+  "ksounds_api": 1,
+  "description": "Independent low-latency MICRO hard gate with hysteresis, hold and de-click ramps.",
+  "provides": [
+    "audio.micro_hard_gate"
+  ],
+  "runtimes": [
+    "audio.micro"
+  ],
+  "nav_order": 25,
+  "hot_reload": true,
+  "owned_paths": [
+    "src/ksound_hub/builtin_modules/hard_gate/module.json",
+    "native_engine/src/hard_gate_dsp.cpp",
+    "native_engine/src/hard_gate_dsp.hpp"
+  ],
+  "shared_paths": [
+    "src/ksound_hub/audio/pipewire_v2_final.py",
+    "src/ksound_hub/glass_app.py",
+    "src/ksound_hub/models.py"
+  ]
+}

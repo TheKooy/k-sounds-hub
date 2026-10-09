@@ -9,10 +9,12 @@ namespace ksound::native {
 std::string try_enable_realtime() {
     std::string result;
 
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
-        result += "mlockall=ok ";
+    // Lock only the pages already present. MCL_FUTURE can turn a normal
+    // capture backlog into allocation failures when RLIMIT_MEMLOCK is low.
+    if (mlockall(MCL_CURRENT) == 0) {
+        result += "mlockall_current=ok ";
     } else {
-        result += "mlockall=fail ";
+        result += "mlockall_current=fail ";
     }
 
     // Do not put the whole native engine in SCHED_FIFO.

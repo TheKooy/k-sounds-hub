@@ -12,13 +12,21 @@ export KSH_CONFIG_DIR="${KSH_CONFIG_DIR:-$HOME/.config/k-sounds-hub}"
 export KSH_IPC_SOCKET_PATH="${KSH_IPC_SOCKET_PATH:-/tmp/ksounds_hub_audio_$(id -u).sock}"
 export KSH_HUD_STATE_DIR="${KSH_HUD_STATE_DIR:-$HOME/.config/audio-stack/hud_overlay}"
 
-# Stable micro path defaults.
-# KSH_NATIVE_MIC=0 keeps the legacy PipeWire loopback micro path active
-# while the native micro engine remains under investigation.
-export KSH_NATIVE_MIC="${KSH_NATIVE_MIC:-0}"
+# The native Micro engine is the validated default. If its binary is absent or
+# cannot start, the Python audio engine automatically falls back to the
+# PipeWire loopback path. KSH_NATIVE_MIC=0 remains available for diagnostics.
+export KSH_NATIVE_MIC="${KSH_NATIVE_MIC:-1}"
 export KSH_MIC_METER_BOOST="${KSH_MIC_METER_BOOST:-4.0}"
 export KSH_MIC_METER_FLOOR="${KSH_MIC_METER_FLOOR:-0.0015}"
 export KSH_LEGACY_MIC_GAIN_PERCENT="${KSH_LEGACY_MIC_GAIN_PERCENT:-115}"
+
+PRESERVE_AUDIO_ROUTING="${KSH_PRESERVE_AUDIO_ROUTING:-0}"
+preserve_audio_routing() {
+  case "${PRESERVE_AUDIO_ROUTING,,}" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 RUNTIME_DIR="$KSH_CONFIG_DIR/runtime"
 LOCK_FILE="$RUNTIME_DIR/app.lock"
@@ -35,8 +43,17 @@ fi
 
 export PYTHONPATH="$REPO_DIR/src"
 
+FRONTEND_MODULE="${KSH_FRONTEND_MODULE:-ksound_hub.glass_app}"
+case "$FRONTEND_MODULE" in
+  ksound_hub.glass_app|ksound_hub.app) ;;
+  *)
+    echo "Unsupported K-Sounds frontend module: $FRONTEND_MODULE" >&2
+    exit 2
+    ;;
+esac
+
 is_real_instance_running() {
-  pgrep -u "$(id -u)" -f 'python(3)? .* -m ksound_hub\.app|ksound_hub\.app' >/dev/null 2>&1
+  pgrep -u "$(id -u)" -f 'python(3)? .* -m ksound_hub\.(glass_app|app)|ksound_hub\.(glass_app|app)' >/dev/null 2>&1
 }
 
 try_restore() {
@@ -63,24 +80,6 @@ cleanup_stale_runtime_files() {
   rm -f "$LOCK_FILE" || true
 }
 
-start_easyeffects_service() {
-  local start_ee="${KSH_START_EASYEFFECTS:-1}"
-  case "${start_ee,,}" in
-    0|false|no|off)
-      return 0
-      ;;
-  esac
-
-  command -v easyeffects >/dev/null 2>&1 || return 0
-
-  if pgrep -u "$(id -u)" -f '(^|/)easyeffects($| )|com.github.wwmm.easyeffects' >/dev/null 2>&1; then
-    return 0
-  fi
-
-  nohup easyeffects --service-mode --hide-window \
-    >"$KSH_CONFIG_DIR/runtime/easyeffects.log" 2>&1 &
-}
-
 start_soundboard_remote_service() {
   local start_remote="${KSH_START_SOUNDBOARD_REMOTE:-1}"
   case "${start_remote,,}" in
@@ -89,23 +88,19 @@ start_soundboard_remote_service() {
       ;;
   esac
 
-  local remote_script="$REPO_DIR/tools/soundboard_remote/ksound_soundboard_web.py"
-  [[ -f "$remote_script" ]] || return 0
-
-  if pgrep -u "$(id -u)" -f 'ksound_soundboard_web\.py' >/dev/null 2>&1; then
+  # A cold K-Sounds launch must always reload the Remote source currently on
+  # disk.  A legacy Remote may still answer /health on port 8765, and the
+  # runtime's `start` action intentionally accepts any healthy responder.
+  # `restart` atomically retires any old ksound_soundboard_web.py process and
+  # spawns the Remote from this exact project tree.  The single-instance fast
+  # path above exits before this function, so clicking the launcher again does
+  # not bounce an already-current Remote.
+  if ! "$PYTHON_BIN" -m ksound_hub.soundboard_remote_runtime \
+    restart --project-root "$REPO_DIR" --quiet
+  then
+    echo "WARNING: Current Soundboard Remote did not start; audio and Glass will continue." >&2
     return 0
   fi
-
-  mkdir -p "$KSH_CONFIG_DIR/runtime"
-
-  nohup env \
-    KSH_RUNTIME_ROLE="soundboard_remote_web" \
-    KSH_CONFIG_DIR="$KSH_CONFIG_DIR" \
-    KSH_IPC_SOCKET_PATH="$KSH_IPC_SOCKET_PATH" \
-    KSOUND_SOUNDBOARD_WEB_PORT="${KSOUND_SOUNDBOARD_WEB_PORT:-8765}" \
-    KSOUND_SOUNDBOARD_DISCOVERY_PORT="${KSOUND_SOUNDBOARD_DISCOVERY_PORT:-8766}" \
-    "$PYTHON_BIN" "$remote_script" \
-    >"$KSH_CONFIG_DIR/runtime/soundboard-web.log" 2>&1 &
 }
 
 cleanup_managed_processes() {
@@ -115,7 +110,7 @@ import signal
 import time
 from pathlib import Path
 
-TARGET_ROLES = {"eq_slot", "meter_probe", "native_engine_shadow", "native_engine_bridge", "native_engine_real", "native_micro_engine", "v2_final_capture", "v2_final_render", "soundboard_remote_web"}
+TARGET_ROLES = {"eq_slot", "meter_probe", "native_meter_engine", "native_engine_shadow", "native_engine_bridge", "native_engine_real", "native_micro_engine", "v2_final_capture", "v2_final_render", "soundboard_remote_web", "hud_overlay_renderer", "glass_device_watch"}
 uid = os.getuid()
 proc_root = Path("/proc")
 pids = []
@@ -168,13 +163,12 @@ def cmdline_for(pid: int) -> str:
 
 
 COMMAND_PATTERNS = (
+    "ksound_native_meter_engine",
     "ksound_native_micro_engine",
     "ksound_native_engine",
     "pipewire -c filter-chain.conf",
     "parec --device=soundboard.monitor --raw --format=float32le --rate=48000 --channels=2 --latency-msec=20",
     "pacat --playback --device=micro_bus --raw --format=float32le --rate=48000 --channels=2 --latency-msec=40 --process-time-msec=10",
-    "parec --device=alsa_input.usb-RODE_Microphones_RODE_NT-USB-00.iec958-stereo --raw --format=float32le --rate=48000 --channels=2 --latency-msec=20",
-    "parec --device=alsa_input.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.mono-fallback --raw --format=float32le --rate=48000 --channels=2 --latency-msec=20",
 )
 
 for entry in proc_root.iterdir():
@@ -216,37 +210,51 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
 PY
 }
 
+# Fast path: if Glass already owns the IPC socket, restore/focus it and exit.
+# Do this before Remote startup or runtime cleanup so a launcher click cannot
+# restart a healthy K-Sounds session.
+if try_restore; then
+  exit 0
+fi
+
+# During the short startup window the process can exist before AudioIpcServer
+# has bound its socket. Glass already watches this activation file, so nudge
+# the existing instance instead of killing/restarting it.
 if is_real_instance_running; then
-  start_soundboard_remote_service
-  if try_restore; then
-    exit 0
-  fi
+  ACTIVATION_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/k-sounds-hub/glass.activate"
+  mkdir -p "$(dirname "$ACTIVATION_FILE")"
+  touch "$ACTIVATION_FILE" 2>/dev/null || true
+  exit 0
 fi
 
 if [[ -S "$IPC_SOCKET" ]] && ! is_real_instance_running; then
   cleanup_stale_runtime_files
 fi
 
-cleanup_managed_processes
-cleanup_stale_runtime_files
+if preserve_audio_routing; then
+  # UI/Core handoff: keep the existing PipeWire graph and K-Sounds audio
+  # workers alive. Only stale UI-owned IPC/lock files are safe to clear here.
+  cleanup_stale_runtime_files
+else
+  cleanup_managed_processes
+  cleanup_stale_runtime_files
 
-if [[ -x "$HOME/.config/audio-stack/audio-setup.sh" ]]; then
-  "$HOME/.config/audio-stack/audio-setup.sh" >/dev/null 2>&1 || true
+  if [[ -x "$HOME/.config/audio-stack/audio-setup.sh" ]]; then
+    "$HOME/.config/audio-stack/audio-setup.sh" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -x "$REPO_DIR/scripts/start_ksound_native_shadow_bridge.sh" ]]; then
+    "$REPO_DIR/scripts/start_ksound_native_shadow_bridge.sh" >/dev/null 2>&1 || true
+  fi
 fi
 
-if [[ -x "$REPO_DIR/scripts/start_overlay_bridge.sh" ]]; then
-  "$REPO_DIR/scripts/start_overlay_bridge.sh" >/dev/null 2>&1 || true
+# Let Qt select the native platform by default. An explicit override remains
+# available for diagnostics without forcing Glass through XWayland.
+if [[ -n "${KSH_QT_PLATFORM:-}" ]]; then
+  export QT_QPA_PLATFORM="$KSH_QT_PLATFORM"
+fi
+if ! preserve_audio_routing; then
+  start_soundboard_remote_service
 fi
 
-if [[ -x "$REPO_DIR/scripts/start_ksound_native_shadow_bridge.sh" ]]; then
-  "$REPO_DIR/scripts/start_ksound_native_shadow_bridge.sh" >/dev/null 2>&1 || true
-fi
-
-# K-Sound UI geometry:
-# Native Wayland restores size but ignores global window position.
-# Run only the PySide app through XWayland/XCB so per-window position restore works.
-export QT_QPA_PLATFORM="${KSH_QT_PLATFORM:-xcb}"
-start_easyeffects_service
-start_soundboard_remote_service
-
-exec "$PYTHON_BIN" -m ksound_hub.app
+exec "$PYTHON_BIN" -m "$FRONTEND_MODULE"

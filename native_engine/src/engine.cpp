@@ -1,13 +1,16 @@
 #include "engine.hpp"
 
 #include "files.hpp"
+#include "finite_guard.hpp"
 #include "realtime.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstddef>
 #include <ctime>
 #include <cstring>
 #include <fcntl.h>
@@ -19,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <sys/types.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -36,6 +40,8 @@ constexpr int PLAYBACK_PROCESS_MS = 40;
 constexpr int PLAYBACK_MIN_RESTART_MS = 1000;
 constexpr int SAMPLE_BYTES = 4;
 constexpr int CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * SAMPLE_BYTES;
+constexpr int FRAME_BYTES = CHANNELS * SAMPLE_BYTES;
+constexpr int MAX_CAPTURE_BUFFER_BYTES = CHUNK_BYTES * 8;
 constexpr float MAX_OUTPUT = 0.98f;
 constexpr float MIX_HEADROOM = 0.72f;
 constexpr float VOLUME_CURVE_EXPONENT = 2.0f;
@@ -265,7 +271,10 @@ struct ChildProcess {
 
         if (pid == target_pid) {
             int status = 0;
-            pid_t res = waitpid(target_pid, &status, WNOHANG);
+            pid_t res = -1;
+            do {
+                res = waitpid(target_pid, &status, 0);
+            } while (res < 0 && errno == EINTR);
             if (res == target_pid) {
                 log_child_event(
                     "child_reap label=" + label +
@@ -284,6 +293,13 @@ ChildProcess spawn_process(const std::vector<std::string>& args, bool write_mode
         return {};
     }
 
+    for (int fd : pipefd) {
+        const int flags = fcntl(fd, F_GETFD, 0);
+        if (flags >= 0) {
+            fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+        }
+    }
+
     std::string stderr_path;
     if (!g_child_log_dir.empty()) {
         try {
@@ -294,6 +310,7 @@ ChildProcess spawn_process(const std::vector<std::string>& args, bool write_mode
         }
     }
 
+    const pid_t owner_pid = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         ::close(pipefd[0]);
@@ -303,6 +320,10 @@ ChildProcess spawn_process(const std::vector<std::string>& args, bool write_mode
     }
 
     if (pid == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != owner_pid) {
+            _exit(125);
+        }
+
         if (write_mode) {
             dup2(pipefd[0], STDIN_FILENO);
         } else {
@@ -350,10 +371,11 @@ ChildProcess spawn_process(const std::vector<std::string>& args, bool write_mode
     } else {
         ::close(pipefd[1]);
         proc.fd = pipefd[0];
-        int flags = fcntl(proc.fd, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(proc.fd, F_SETFL, flags | O_NONBLOCK);
-        }
+    }
+
+    const int flags = fcntl(proc.fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(proc.fd, F_SETFL, flags | O_NONBLOCK);
     }
     return proc;
 }
@@ -365,6 +387,7 @@ struct ChannelState {
     bool enabled{false};
     bool muted{false};
     float volume{0.0f};
+    float stereo_width{1.0f};
     std::string target_label{};
     std::string target_sink{};
     std::vector<Biquad> filters;
@@ -390,6 +413,8 @@ struct CaptureClient {
             {
                 "parec",
                 std::string("--device=") + key + ".monitor",
+                "--client-name=K-Sounds Native Playback",
+                std::string("--stream-name=KSH_NATIVE_CAPTURE_") + safe_child_label(key),
                 "--raw",
                 "--format=float32le",
                 "--rate=48000",
@@ -422,6 +447,14 @@ struct CaptureClient {
             ssize_t n = ::read(proc.fd, tmp, sizeof(tmp));
             if (n > 0) {
                 buffer.insert(buffer.end(), tmp, tmp + n);
+                if (buffer.size() > static_cast<std::size_t>(MAX_CAPTURE_BUFFER_BYTES)) {
+                    std::size_t drop = buffer.size() - MAX_CAPTURE_BUFFER_BYTES;
+                    const std::size_t remainder = drop % FRAME_BYTES;
+                    if (remainder != 0) {
+                        drop += FRAME_BYTES - remainder;
+                    }
+                    buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(drop));
+                }
                 continue;
             }
             if (n == 0) {
@@ -458,6 +491,10 @@ struct CaptureClient {
         std::vector<float> out(CHUNK_FRAMES * CHANNELS, 0.0f);
         std::memcpy(out.data(), buffer.data(), CHUNK_BYTES);
         buffer.erase(buffer.begin(), buffer.begin() + CHUNK_BYTES);
+
+        // Core numeric-safety boundary: preserve every finite PCM sample
+        // exactly and neutralize only NaN/+Inf/-Inf before any stateful DSP.
+        sanitize_finite_pcm(out);
         last_chunk = out;
         gap_fill_chunks = 0;
 
@@ -478,6 +515,7 @@ struct PlaybackClient {
     ChildProcess proc;
     std::chrono::steady_clock::time_point last_start{};
     int backoff_log_count{0};
+    int write_break_log_count{0};
 
     void ensure_started() {
         if (proc.running()) {
@@ -506,6 +544,8 @@ struct PlaybackClient {
                 "pacat",
                 "--playback",
                 std::string("--device=") + sink_name,
+                "--client-name=K-Sounds Native Playback",
+                std::string("--stream-name=KSH_NATIVE_PLAYBACK_") + safe_child_label(label),
                 "--raw",
                 "--format=float32le",
                 "--rate=48000",
@@ -538,11 +578,21 @@ struct PlaybackClient {
             if (n < 0 && errno == EINTR) {
                 continue;
             }
-            log_child_event(
-                "playback_write_break label=" + label +
-                " sink=" + sink_name +
-                " errno=" + std::to_string(errno));
+            const int write_errno = n < 0 ? errno : 0;
+            if (write_break_log_count < 3) {
+                log_child_event(
+                    "playback_write_break label=" + label +
+                    " sink=" + sink_name +
+                    " errno=" + std::to_string(write_errno));
+                ++write_break_log_count;
+            }
+            if (write_errno == EPIPE || write_errno == EBADF) {
+                proc.stop();
+            }
             break;
+        }
+        if (total == 0) {
+            write_break_log_count = 0;
         }
     }
 };
@@ -610,6 +660,22 @@ bool same_filter_shape(const Biquad& a, const Biquad& b) {
            std::abs(a.a2 - b.a2) < eps;
 }
 
+
+void apply_stereo_width(std::vector<float>& frames, float width) {
+    width = clampf(width, 0.0f, 1.0f);
+    if (std::fabs(width - 1.0f) < 0.0001f) {
+        return;
+    }
+
+    for (std::size_t i = 0; i + 1 < frames.size(); i += 2) {
+        const float left = frames[i];
+        const float right = frames[i + 1];
+        const float mid = 0.5f * (left + right);
+        frames[i] = mid + (left - mid) * width;
+        frames[i + 1] = mid + (right - mid) * width;
+    }
+}
+
 void parse_state_text(const std::string& text) {
     std::map<std::string, ChannelState> parsed;
     for (const auto* key : PLAYBACK_KEYS) {
@@ -639,6 +705,15 @@ void parse_state_text(const std::string& text) {
             st.volume = volume_percent_to_gain(std::stof(parts[4]));
         } catch (...) {
             st.volume = 1.0f;
+        }
+
+        st.stereo_width = 1.0f;
+        if (parts.size() >= 9) {
+            try {
+                st.stereo_width = clampf(std::stof(parts[8]) / 100.0f, 0.0f, 1.0f);
+            } catch (...) {
+                st.stereo_width = 1.0f;
+            }
         }
         st.target_label = parts[5];
         st.target_sink = parts[6];
@@ -736,6 +811,10 @@ std::vector<float> process_channel(CaptureClient& capture, const ChannelState& s
 
     for (auto& filt : const_cast<std::vector<Biquad>&>(state.filters)) {
         filt.process(frames);
+    }
+
+    if (state.stereo_width < 0.999f) {
+        apply_stereo_width(frames, state.stereo_width);
     }
 
     const float base_gain = should_play ? state.volume : 0.0f;
@@ -891,6 +970,7 @@ void Engine::stop_all() {
 int Engine::run() {
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
+    std::signal(SIGPIPE, SIG_IGN);
 
     g_child_log_dir = config_.log_path.parent_path() / "children";
     log("engine_start " + try_enable_realtime());
@@ -908,6 +988,11 @@ int Engine::run() {
         maybe_reload_volume_state();
         tick_once();
         next += period;
+        const auto now = std::chrono::steady_clock::now();
+        if (now > next + period * 4) {
+            log("scheduler_resync_after_pause");
+            next = now + period;
+        }
         std::this_thread::sleep_until(next);
     }
 

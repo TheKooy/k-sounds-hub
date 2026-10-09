@@ -41,7 +41,7 @@ Extra channels:
 
 ## Playback architecture
 
-The current playback render path uses the native C++ engine:
+The native C++ playback engine is available at:
 
 - `native_engine/build/ksound_native_engine`
 
@@ -49,17 +49,17 @@ The engine reads runtime state from:
 
 - `~/.config/k-sounds-hub/runtime/native-engine/`
 
-It owns the current final playback render path.
+It is currently disabled by default while the stable PipeWire/filter-chain path remains active. It must not be described as the distributed final renderer until its stress tests pass.
 
 The cleanup removed obsolete Python playback prototypes from the source tree. Those old files remain available in Git history.
 
 ## Overlay
 
-The current overlay binary is:
+The current HUD renderer source and local build path are:
 
-- `tools/legacy_hud/build/audio-hud-overlay`
+- `tools/hud_overlay/build/audio-hud-overlay`
 
-The `legacy_hud` name is historical. The binary is still part of the current runtime and should not be deleted unless a replacement overlay exists.
+This renderer is part of the current runtime. Glass starts it through `scripts/start_hud.sh` when the Overlay option is enabled.
 
 ## Android soundboard remote
 
@@ -93,7 +93,7 @@ These are expected to stay local and ignored by Git:
 
 - `.venv/`
 - `native_engine/build/`
-- `tools/legacy_hud/build/`
+- `tools/hud_overlay/build/`
 - `dist/`
 - `android-soundboard-apk/gen/`
 - `android-soundboard-apk/classes/`
@@ -119,4 +119,3 @@ Completed:
 ## Recommended PipeWire settings
 
 For the current heavy-use routing profile, use `48000 Hz` with a `512` quantum when gaming or running voice chat at the same time. This is a stability recommendation, not a hard application requirement. The previous `256 / 48000` runtime can be too aggressive for the full virtual routing graph on some systems.
-

@@ -37,6 +37,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[dev]
 
+      - name: Validate launch contract
+        run: |
+          python scripts/check_launch_contract.py
+          python scripts/check_install_contract.py
+          python scripts/check_runtime_lifecycle_contract.py
+          python scripts/check_version_consistency.py
+
+      - name: Validate isolated install lifecycle
+        run: ./scripts/test_install_lifecycle.sh
+
+      - name: Build native runtime components
+        run: ./scripts/build_ksound_native_engine.sh "$PWD"
+
       - name: Install Qt multimedia runtime libraries
         run: |
           sudo apt-get update
