@@ -13,8 +13,8 @@ def test_public_checkpoint_version_and_meter_defaults():
     build = [node.value.value for node in tree.body if isinstance(node, ast.Assign)
              and any(isinstance(t, ast.Name) and t.id == 'APP_BUILD' for t in node.targets)
              and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)]
-    assert build == ['IP15m12']
-    assert '__version__ = "0.4.7"' in version
+    assert build == ['IP17y-standard']
+    assert '__version__ = "0.4.8"' in version
     assert 'KSH_METER_INTERVAL_MS", "25"' in glass
     assert "KSH_METER_LED_WIDTH_PX', '14'" in glass
     assert "KSH_METER_EVEN_GRID', '0'" in glass

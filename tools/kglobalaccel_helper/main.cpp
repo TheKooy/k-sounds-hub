@@ -171,11 +171,13 @@ private:
 
     QList<QKeySequence> currentShortcuts(const QString &shortcutId) const
     {
-        QAction *action = actionFor(shortcutId);
-        if (!action) {
+        // Query KDE's live registry, not only this QAction's local cache.
+        // removeAllShortcuts() unregisters the action locally; the old code
+        // therefore reported DISABLED without verifying KDE's actual state.
+        if (!actionFor(shortcutId)) {
             return {};
         }
-        return KGlobalAccel::self()->shortcut(action);
+        return KGlobalAccel::self()->globalShortcut(m_appId, shortcutId);
     }
 
     QString describeConflicts(const QKeySequence &sequence) const
@@ -270,6 +272,11 @@ private:
         } else {
             action->setText(description);
         }
+        // An empty K-Sounds field means no global action should remain in KDE.
+        // Restrict removal to this app-owned QAction; never steal other actions.
+        if (initial.isEmpty()) {
+            KGlobalAccel::self()->removeAllShortcuts(action);
+        }
 
         QTextStream(stdout) << "READY\t" << shortcutId << "\tKGLOBALACCEL" << Qt::endl;
         reportSync(shortcutId);
@@ -298,7 +305,12 @@ private:
 
     void handleCommand(const QString &raw)
     {
-        const QString line = raw.trimmed();
+        // Preserve the last TAB: SET\t<id>\t means DELETE, not legacy SET.
+        // QString::trimmed() used to remove it and silently misroute the command.
+        QString line = raw;
+        if (line.endsWith(QLatin1Char('\r'))) {
+            line.chop(1);
+        }
         if (line.isEmpty()) {
             return;
         }
@@ -321,9 +333,13 @@ private:
         }
         if (command == QStringLiteral("SET")) {
             if (parts.size() >= 3) {
+                // Includes an intentionally empty last field: clear this ID.
                 setShortcut(parts.value(1), parts.mid(2).join(QStringLiteral("\t")));
-            } else {
+            } else if (!m_legacyShortcutId.isEmpty()) {
                 setShortcut(m_legacyShortcutId, parts.value(1));
+            } else {
+                fail(QString(), QStringLiteral("malformed-SET: missing trigger field"),
+                     QStringLiteral("COMMAND_ERROR"));
             }
             return;
         }
@@ -371,9 +387,22 @@ private:
             }
         }
 
-        const QList<QKeySequence> shortcuts = sequence.isEmpty()
-            ? QList<QKeySequence>{}
-            : QList<QKeySequence>{sequence};
+        // Clearing the editor must also unregister the KDE action. A
+        // blank setShortcut() may leave a ghost entry in System Settings.
+        if (sequence.isEmpty()) {
+            KGlobalAccel::self()->removeAllShortcuts(action);
+            if (!currentShortcuts(shortcutId).isEmpty()) {
+                fail(shortcutId, QStringLiteral("KDE still owns cleared shortcut"),
+                     QStringLiteral("SET_ERROR"));
+                reportSync(shortcutId);
+                return;
+            }
+            QTextStream(stdout) << "SET_OK\t" << shortcutId << "\t" << Qt::endl;
+            reportSync(shortcutId);
+            return;
+        }
+
+        const QList<QKeySequence> shortcuts = QList<QKeySequence>{sequence};
 
         const bool ok = KGlobalAccel::self()->setShortcut(
             action,
@@ -386,6 +415,12 @@ private:
             return;
         }
 
+        if (currentShortcuts(shortcutId) != shortcuts) {
+            fail(shortcutId, QStringLiteral("KDE did not persist requested binding: ")
+                 + portable(sequence), QStringLiteral("SET_ERROR"));
+            reportSync(shortcutId);
+            return;
+        }
         QTextStream(stdout)
             << "SET_OK\t" << shortcutId << "\t" << portable(sequence) << Qt::endl;
         reportSync(shortcutId);

@@ -43,6 +43,7 @@ class _KdeShortcutHub:
         self._stderr_buffer = ""
         self._ready = False
         self._clients: dict[str, KdeGlobalShortcut] = {}
+        self._pending_user_triggers: dict[str, str] = {}
 
     @property
     def ready(self) -> bool:
@@ -66,13 +67,24 @@ class _KdeShortcutHub:
         return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
 
     def _register_client(self, client: "KdeGlobalShortcut") -> bool:
-        return self._write(
-            "REGISTER\t{}\t{}\t{}".format(
-                self._clean_field(client.shortcut_id),
-                self._clean_field(client.description),
-                self._clean_field(client.trigger),
-            )
+        # KDE Autoloading restores old shortcuts, including single-letter keys,
+        # until explicitly overridden. The local effective trigger is already
+        # blank for unchecked actions (Glass passes blank to bridge.start).
+        # Queue a SET for every REGISTER, including an empty value; KDE's
+        # NoAutoloading path must become authoritative before exposing SYNC.
+        shortcut_id = self._clean_field(client.shortcut_id)
+        trigger = self._clean_field(client.trigger)
+        register = "REGISTER\t{}\t{}\t{}".format(
+            shortcut_id, self._clean_field(client.description), trigger
         )
+        client._ksh_sets_waiting_for_ack += 1
+        if not self._write(register):
+            client._ksh_sets_waiting_for_ack -= 1
+            return False
+        if not self._write(f"SET\t{shortcut_id}\t{trigger}"):
+            client._ksh_sets_waiting_for_ack -= 1
+            return False
+        return True
 
     def ensure_started(self) -> bool:
         if self.ready:
@@ -154,12 +166,21 @@ class _KdeShortcutHub:
         current = self._clients.get(client.shortcut_id)
         if current is client:
             self._clients.pop(client.shortcut_id, None)
+            self._pending_user_triggers.pop(client.shortcut_id, None)
         if not self._clients:
             self.stop()
 
     def set_trigger(self, shortcut_id: str, trigger: str) -> bool:
+        # An in-app edit may arrive before the helper's READY event. Queue
+        # it rather than silently letting REGISTER autoload the stale KDE key.
+        if shortcut_id not in self._clients:
+            return False
+        clean_trigger = self._clean_field(trigger)
+        if not self._ready:
+            self._pending_user_triggers[shortcut_id] = clean_trigger
+            return self.ensure_started()
         return self._write(
-            f"SET\t{self._clean_field(shortcut_id)}\t{self._clean_field(trigger)}"
+            f"SET\t{self._clean_field(shortcut_id)}\t{clean_trigger}"
         )
 
     def refresh(self, shortcut_id: str) -> bool:
@@ -208,6 +229,12 @@ class _KdeShortcutHub:
             self._ready = True
             for client in tuple(self._clients.values()):
                 self._register_client(client)
+            # REGISTER must precede user-requested SET. Preserve empty values.
+            pending = tuple(self._pending_user_triggers.items())
+            self._pending_user_triggers.clear()
+            for shortcut_id, trigger in pending:
+                if shortcut_id in self._clients:
+                    self._write(f"SET\t{self._clean_field(shortcut_id)}\t{trigger}")
             return
 
         shortcut_id = parts[1].strip() if len(parts) > 1 else ""
@@ -285,6 +312,7 @@ class KdeGlobalShortcut:
         self.detail = "not started"
         self._sticky_error = ""
         self._attached = False
+        self._ksh_sets_waiting_for_ack = 0
 
     def state(self) -> GlobalShortcutState:
         return GlobalShortcutState(
@@ -304,6 +332,7 @@ class KdeGlobalShortcut:
             self._on_state_change(self.state())
 
     def _hub_error(self, message: str) -> None:
+        self._ksh_sets_waiting_for_ack = 0
         self.active = False
         self.portal_ready = False
         self.registered = False
@@ -335,6 +364,11 @@ class KdeGlobalShortcut:
             return
 
         if event == "SYNC":
+            # REGISTER and Qt's change signal may report a transient KDE
+            # state before our user-issued SET has been acknowledged.  Wait
+            # for the helper's SET_OK (or CONFLICT/SET_ERROR) and its final SYNC.
+            if self._ksh_sets_waiting_for_ack > 0:
+                return
             state = parts[2].strip().upper() if len(parts) > 2 else "DISABLED"
             trigger = "\t".join(parts[3:]).strip() if len(parts) > 3 else ""
             self.portal_ready = True
@@ -346,6 +380,7 @@ class KdeGlobalShortcut:
                 self.trigger = trigger or self.trigger
                 normal_detail = f"KDE global shortcut active — {trigger}" if trigger else "KDE global shortcut active"
             else:
+                self.trigger = ""
                 normal_detail = "KDE global shortcut disabled"
             self.detail = self._sticky_error or normal_detail
             self._emit_state()
@@ -362,6 +397,9 @@ class KdeGlobalShortcut:
             return
 
         if event == "SET_OK":
+            self._ksh_sets_waiting_for_ack = max(
+                0, self._ksh_sets_waiting_for_ack - 1
+            )
             # SET_OK is also immediately followed by SYNC.  SYNC is the single
             # source of truth for trigger/enabled state; emitting here would
             # momentarily expose the previous state and can undo an in-app remap.
@@ -370,6 +408,9 @@ class KdeGlobalShortcut:
             return
 
         if event == "CONFLICT":
+            self._ksh_sets_waiting_for_ack = max(
+                0, self._ksh_sets_waiting_for_ack - 1
+            )
             trigger = parts[2].strip() if len(parts) > 2 else ""
             owner = "\t".join(parts[3:]).strip() if len(parts) > 3 else ""
             if trigger and owner:
@@ -383,6 +424,7 @@ class KdeGlobalShortcut:
             return
 
         if event in {"SET_ERROR", "COMMAND_ERROR", "ERROR"}:
+            self._ksh_sets_waiting_for_ack = 0
             message = "\t".join(parts[2:]).strip() if len(parts) > 2 else ""
             self.detail = message or "KGlobalAccel helper error"
             if event == "ERROR":
@@ -391,6 +433,7 @@ class KdeGlobalShortcut:
             self._emit_state()
 
     def start(self, trigger: str) -> GlobalShortcutState:
+        self._ksh_sets_waiting_for_ack = 0
         self.trigger = str(trigger or "").strip()
         self.active = False
         self.portal_ready = False
@@ -405,13 +448,26 @@ class KdeGlobalShortcut:
         return self.state()
 
     def set_trigger(self, trigger: str) -> bool:
-        self.trigger = str(trigger or "").strip()
-        return bool(self._attached and _SHARED_HUB.set_trigger(self.shortcut_id, self.trigger))
+        # Track each user-requested operation until KDE acknowledges it.  Do
+        # not interpret a REGISTER/SYNC intermediate state as a failed edit.
+        wanted = str(trigger or "").strip()
+        if not self._attached:
+            return False
+        self._ksh_sets_waiting_for_ack += 1
+        accepted = bool(_SHARED_HUB.set_trigger(self.shortcut_id, wanted))
+        if not accepted:
+            self._ksh_sets_waiting_for_ack = max(
+                0, self._ksh_sets_waiting_for_ack - 1
+            )
+            return False
+        self.trigger = wanted
+        return True
 
     def refresh(self) -> bool:
         return bool(self._attached and _SHARED_HUB.refresh(self.shortcut_id))
 
     def stop(self) -> None:
+        self._ksh_sets_waiting_for_ack = 0
         if self._attached:
             _SHARED_HUB.detach(self)
         self._attached = False

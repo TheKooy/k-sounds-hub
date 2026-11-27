@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QScrollArea,
     QSlider,
+    QToolButton,
     QStackedLayout,
     QStackedWidget,
     QVBoxLayout,
@@ -99,7 +100,7 @@ CHANNEL_ICON_PATHS = {
     "return-mic": CHANNEL_ICON_DIR / "return-mic.png",
 }
 SOUNDBOARD_PATH = CONFIG_DIR / "soundboard.json"
-APP_BUILD = "IP15m12"
+APP_BUILD = "IP17y-standard"
 SOUNDBOARD_RESTART_PRE_MUTE_SECONDS = 0.03
 SOUNDBOARD_RESTART_POST_MUTE_SECONDS = 0.12
 
@@ -5205,6 +5206,35 @@ QFrame#channelCard[muted="true"]:hover {
     border: none;
 }
 
+QScrollArea#navScroll,
+QWidget#navScrollContent {
+    border: none;
+    background: transparent;
+}
+
+QToolButton#railMenuButton {
+    min-width: 50px;
+    max-width: 50px;
+    min-height: 38px;
+    max-height: 38px;
+    padding: 0px;
+    border-radius: 9px;
+    background: transparent;
+    border: none;
+    color: rgba(226, 242, 255, 190);
+    font-size: 22px;
+}
+
+QToolButton#railMenuButton:hover {
+    background: rgba(30, 56, 84, 150);
+    border: none;
+}
+
+QToolButton#railMenuButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+
 QPushButton#windowButton {
     min-width: 30px;
     max-width: 30px;
@@ -6584,10 +6614,61 @@ class ShortcutKeyEdit(QKeySequenceEdit):
         self._last_committed = self._capture_original
         super().focusInEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        assign = menu.addAction("Saisir manuellement une combinaison…")
+        clear_action = menu.addAction("Effacer ce raccourci")
+        choice = menu.exec(event.globalPos())
+        if choice is clear_action:
+            self.setShortcutText("")
+            self.shortcutCommitted.emit("")
+            event.accept()
+            return
+        if choice is not assign:
+            event.accept()
+            return
+        initial = self.keySequence().toString(QKeySequence.PortableText)
+        typed, ok = QInputDialog.getText(
+            self, "Raccourci K-Sounds", "Combinaison (ex. Ctrl+F20) :",
+            QLineEdit.EchoMode.Normal, initial
+        )
+        if not ok:
+            event.accept()
+            return
+        typed = typed.strip()
+        sequence = QKeySequence(typed, QKeySequence.PortableText)
+        portable = sequence.toString(QKeySequence.PortableText).strip()
+        if typed and (not portable or sequence.count() != 1 or
+                      shortcut_trigger_is_reserved(portable)):
+            QMessageBox.warning(self, "Raccourci invalide",
+                                "Indiquez une combinaison valide comme Ctrl+F20.")
+            event.accept()
+            return
+        self.setShortcutText(portable if typed else "")
+        self.shortcutCommitted.emit(portable if typed else "")
+        event.accept()
+
+    def enterEvent(self, event) -> None:
+        sid = str(self.property("kshShortcutId") or "")
+        parent = self.parentWidget()
+        while sid and parent is not None:
+            describe = getattr(parent, "_ksh_shortcut_hover_text", None)
+            if callable(describe):
+                self.setToolTip(describe(sid))
+                break
+            parent = parent.parentWidget()
+        super().enterEvent(event)
+
     @staticmethod
     def _sequence_from_event(event) -> QKeySequence:
-        # Qt 6 exposes the already-normalized QKeyCombination.  Keep a small
-        # integer fallback for older PySide6 builds.
+        # IP17u: build F1..F24 explicitly. Qt/Wayland may report these
+        # differently from printable keys, especially with modifiers.
+        key = event.key()
+        if Qt.Key_F1 <= key <= Qt.Key_F24:
+            modifiers = event.modifiers()
+            modifiers_value = int(getattr(modifiers, "value", modifiers))
+            key_value = int(getattr(key, "value", key))
+            return QKeySequence(modifiers_value | key_value)
         try:
             return QKeySequence(event.keyCombination())
         except Exception:
@@ -8185,6 +8266,7 @@ class ChannelCard(QFrame):
 
             editor = ShortcutKeyEdit(popover)
             editor.setObjectName("stereoPopoverShortcutEdit")
+            editor.setProperty("kshShortcutId", mixer_shortcut_id(self.channel_key, action_key))
             editor.setFixedHeight(26)
             editor.setMinimumWidth(112)
             editor.setToolTip(
@@ -9773,6 +9855,7 @@ class EqPanel(QWidget):
         self.preset_shortcut_edit.blockSignals(True)
         self.preset_shortcut_check.blockSignals(True)
         try:
+            self.preset_shortcut_edit.setProperty("kshShortcutId", micro_eq_preset_shortcut_id(self._current_profile_name()))
             self.preset_shortcut_edit.setShortcutText(str(trigger or ""))
             self.preset_shortcut_check.setChecked(bool(enabled and str(trigger or "").strip()))
         finally:
@@ -10739,6 +10822,7 @@ QFrame#soundPadCard QPushButton#soundPadEmoji {
 
         editor = ShortcutKeyEdit(popover)
         editor.setObjectName("padShortcutEdit")
+        editor.setProperty("kshShortcutId", soundboard_pad_shortcut_id(self._slot_key))
         editor.setFixedHeight(28)
         editor.setMinimumWidth(150)
         editor.setToolTip("Press one global shortcut. Backspace/Delete clears; Enter validates; Esc cancels.")
@@ -13277,6 +13361,7 @@ class Drawer(AndroidPairOverlayMixin, QFrame):
             self._add_page("voice_fx", self._voice_fx_page())
         if self._module_is_enabled("pads"):
             self._add_page("pads", self._pads_page())
+        self._add_page("modules", self._modules_page())
         self._add_page("settings", self._settings_page())
         self.refresh_external_pages()
 
@@ -13785,20 +13870,15 @@ class Drawer(AndroidPairOverlayMixin, QFrame):
             detached.sync_state()
 
 
-    def _settings_page(self) -> QWidget:
+    def _modules_page(self) -> QWidget:
+        """Existing standard module controls, isolated from general Settings."""
         content = QWidget()
         root = QVBoxLayout(content)
         root.setContentsMargins(2, 4, 2, 4)
         root.setSpacing(7)
 
-        title = QLabel("Settings")
-        title.setObjectName("sectionTitle")
-        root.addWidget(title)
-
-        settings = getattr(self._backend_controller, "settings", None)
-
         modules_title = QLabel("Modules")
-        modules_title.setObjectName("settingsSectionTitle")
+        modules_title.setObjectName("sectionTitle")
         modules_title.setStyleSheet("font-weight: 850; margin-top: 2px;")
         root.addWidget(modules_title)
 
@@ -13917,6 +13997,21 @@ class Drawer(AndroidPairOverlayMixin, QFrame):
 
             root.addWidget(card)
             self._refresh_module_state_row(module_id)
+
+        root.addStretch(1)
+        return self._make_scroll_page(content)
+
+    def _settings_page(self) -> QWidget:
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(2, 4, 2, 4)
+        root.setSpacing(7)
+
+        title = QLabel("Settings")
+        title.setObjectName("sectionTitle")
+        root.addWidget(title)
+
+        settings = getattr(self._backend_controller, "settings", None)
 
         extensions = getattr(
             self._backend_controller,
@@ -14085,6 +14180,7 @@ class Drawer(AndroidPairOverlayMixin, QFrame):
         root.addWidget(self.micro_processing_ab_kde_status)
 
         self.micro_processing_ab_shortcut_edit = ShortcutKeyEdit()
+        self.micro_processing_ab_shortcut_edit.setProperty("kshShortcutId", "micro.tune.toggle")
         self.micro_processing_ab_shortcut_edit.setShortcutText(
             str(getattr(settings, "micro_processing_ab_shortcut", "Ctrl+B") or "")
         )
@@ -14285,42 +14381,34 @@ class Drawer(AndroidPairOverlayMixin, QFrame):
         self._refresh_module_state_row(module_id)
 
     def _rebuild_module_settings(self) -> None:
-        old = self.stack.widget(self._page_indices["settings"])
-        was_current = self.stack.currentWidget() is old
+        """Refresh installed module cards and separately hosted preferences."""
+        old_modules = self.stack.widget(self._page_indices["modules"])
+        old_settings = self.stack.widget(self._page_indices["settings"])
+        was_modules = self.stack.currentWidget() is old_modules
+        was_settings = self.stack.currentWidget() is old_settings
 
-        for surface in getattr(
-            self,
-            "_external_settings_specs",
-            ()
-        ):
-            self._external_action_status_labels.pop(
-                surface.route,
-                None
-            )
+        for surface in getattr(self, "_external_settings_specs", ()):
+            self._external_action_status_labels.pop(surface.route, None)
 
-        self.stack.removeWidget(old)
-        old.deleteLater()
+        for widget in (old_modules, old_settings):
+            self.stack.removeWidget(widget)
+            widget.deleteLater()
 
+        # QStackedWidget may renumber pages when old ones are removed.
         self._page_indices = {
-            str(
-                getattr(
-                    self.stack.widget(i),
-                    "_ksounds_route"
-                )
-            ): i
+            str(getattr(self.stack.widget(i), "_ksounds_route")): i
             for i in range(self.stack.count())
-            if getattr(
-                self.stack.widget(i),
-                "_ksounds_route",
-                None
-            )
+            if getattr(self.stack.widget(i), "_ksounds_route", None)
         }
+        modules_page = self._modules_page()
+        settings_page = self._settings_page()
+        self._add_page("modules", modules_page)
+        self._add_page("settings", settings_page)
 
-        replacement = self._settings_page()
-        self._add_page("settings", replacement)
-
-        if was_current:
-            self.stack.setCurrentWidget(replacement)
+        if was_modules:
+            self.stack.setCurrentWidget(modules_page)
+        elif was_settings:
+            self.stack.setCurrentWidget(settings_page)
 
     def _choose_module_package(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -15443,9 +15531,38 @@ QPushButton#exitNoButton:default {
         self.nav_frame = QFrame()
         self.nav_frame.setObjectName("navRail")
         self.nav_frame.setFixedWidth(68)
-        self.nav_layout = QVBoxLayout(self.nav_frame)
-        self.nav_layout.setContentsMargins(6, 7, 6, 7)
+        # IP17r: scroll only work destinations, keep utilities fixed at rail foot.
+        self.rail_layout = QVBoxLayout(self.nav_frame)
+        self.rail_layout.setContentsMargins(6, 7, 6, 7)
+        self.rail_layout.setSpacing(6)
+        self.nav_scroll = QScrollArea(self.nav_frame)
+        self.nav_scroll.setObjectName("navScroll")
+        self.nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.nav_scroll.setWidgetResizable(True)
+        self.nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.nav_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.nav_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.nav_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.nav_scroll_content = QWidget()
+        self.nav_scroll_content.setObjectName("navScrollContent")
+        self.nav_layout = QVBoxLayout(self.nav_scroll_content)
+        self.nav_layout.setContentsMargins(0, 0, 0, 0)
         self.nav_layout.setSpacing(6)
+        self.nav_scroll.setWidget(self.nav_scroll_content)
+        self.rail_layout.addWidget(self.nav_scroll, 1)
+
+        self.utilities_button = QToolButton(self.nav_frame)
+        self.utilities_button.setObjectName("railMenuButton")
+        self.utilities_button.setText("⋯")
+        self.utilities_button.setToolTip("Modules and Settings")
+        self.utilities_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        utilities_menu = QMenu(self.utilities_button)
+        modules_action = utilities_menu.addAction("Modules")
+        modules_action.triggered.connect(lambda _checked=False: self._show_aux_page("modules"))
+        settings_action = utilities_menu.addAction("Settings")
+        settings_action.triggered.connect(lambda _checked=False: self._show_aux_page("settings"))
+        self.utilities_button.setMenu(utilities_menu)
+        self.rail_layout.addWidget(self.utilities_button, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
@@ -15775,7 +15892,7 @@ QPushButton#exitNoButton:default {
             for surface in extensions.active_surfaces("desktop"):
                 if surface.route in pages:
                     specs.append((surface.route, surface.icon, surface.label))
-        specs.append(("settings", "⚙", "Settings"))
+        # Settings/Modules are behind the pinned rail menu.
         return specs
 
     def _rebuild_navigation(self, preferred_route: str | None = None) -> str:
@@ -15784,6 +15901,8 @@ QPushButton#exitNoButton:default {
             or getattr(self, "_current_nav_route", "mixer")
             or "mixer"
         )
+        scroller = getattr(self, "nav_scroll", None)
+        previous_scroll = scroller.verticalScrollBar().value() if scroller else 0
         layout = self.nav_layout
         while layout.count():
             item = layout.takeAt(0)
@@ -15805,10 +15924,11 @@ QPushButton#exitNoButton:default {
 
         specs = self._navigation_specs()
         available = {item[0] for item in specs}
-        if route not in available:
+        auxiliary_route = route in {"modules", "settings"}
+        if route not in available and not auxiliary_route:
             route = "mixer"
 
-        selected_id = 0
+        selected_id = None if auxiliary_route else 0
         for idx, (item_route, icon, label) in enumerate(specs):
             button = NavButton(icon, label)
             self.nav_buttons.append(button)
@@ -15820,10 +15940,12 @@ QPushButton#exitNoButton:default {
                 selected_id = idx
         layout.addStretch(1)
         self.nav_group.idClicked.connect(self._on_nav_clicked)
-        selected = self.nav_group.button(selected_id)
+        selected = self.nav_group.button(selected_id) if selected_id is not None else None
         if selected is not None:
             selected.setChecked(True)
         self._current_nav_route = route
+        if scroller is not None:
+            QTimer.singleShot(0, lambda s=scroller, y=previous_scroll: s.verticalScrollBar().setValue(y))
         return route
 
     def _on_module_state_changed(self, module_id: str) -> None:
@@ -15933,6 +16055,23 @@ QPushButton#exitNoButton:default {
                             f"Module {wanted}: disable did not complete; "
                             "not uninstalled"
                         )
+
+    def _show_aux_page(self, route: str) -> None:
+        """Open the STANDARD existing Settings/Modules section, no dev logic."""
+        if route not in {"modules", "settings"}:
+            return
+        self._current_nav_route = route
+        self.nav_group.setExclusive(False)
+        try:
+            for button in self.nav_buttons:
+                button.setChecked(False)
+        finally:
+            self.nav_group.setExclusive(True)
+        self.drawer.setVisible(True)
+        self.drawer.show_page(route)
+        scroll = self.drawer.stack.currentWidget()
+        if isinstance(scroll, QScrollArea):
+            scroll.verticalScrollBar().setValue(0)
 
     def _show_drawer_nav_page(self, nav_id: int) -> None:
         wanted = int(nav_id)
@@ -16116,6 +16255,124 @@ QPushButton#exitNoButton:default {
         if self.backend_controller.select_eq_profile("micro", wanted):
             self.backend_controller.status_changed.emit(f"MICRO preset shortcut → {wanted}")
 
+    def _ksh_shortcut_hover_text(self, shortcut_id: str) -> str:
+        """Show duplicate owners, including disabled stored chords, at hover time."""
+        hints = getattr(self, "_ksh_shortcut_hints", {})
+        lines = []
+        action = self.shortcut_registry.get(shortcut_id)
+        if action is not None:
+            binding = action.binding
+            chord = str(binding.trigger or "").strip()
+            if chord:
+                try:
+                    def portable(value):
+                        return QKeySequence(
+                            value, QKeySequence.PortableText
+                        ).toString(QKeySequence.PortableText).casefold()
+                    canonical = portable(chord)
+                except Exception:
+                    canonical = chord.casefold()
+                    def portable(value):
+                        return str(value).strip().casefold()
+                conflicts = [
+                    other for other in self.shortcut_registry.bindings()
+                    if other.shortcut_id != shortcut_id and other.trigger
+                    and portable(other.trigger) == canonical
+                ]
+                if conflicts:
+                    owners = ", ".join(
+                        f"{other.description} ({'actif' if other.enabled else 'désactivé'})"
+                        for other in conflicts
+                    )
+                    lines.append(f"DOUBLON {chord} : également sur {owners}")
+                lines.append(f"{chord} — {'activé' if binding.enabled else 'désactivé dans K-Sounds'}")
+        old_hint = str(hints.get(shortcut_id, "") or "").strip() if isinstance(hints, dict) else ""
+        if old_hint:
+            lines.append(old_hint)
+        if not lines:
+            return "Appuyez sur une touche. Suppr/Retour efface; clic droit pour saisir manuellement."
+        return "\n".join(lines)
+
+    def _ksh_shortcut_feedback(self, shortcut_id: str, detail: str = "") -> None:
+        """Keep KDE conflict information as hover text on the affected editor."""
+        hints = getattr(self, "_ksh_shortcut_hints", None)
+        if hints is None:
+            hints = self._ksh_shortcut_hints = {}
+        if detail:
+            hints[shortcut_id] = str(detail)
+        else:
+            hints.pop(shortcut_id, None)
+        for editor in self.findChildren(ShortcutKeyEdit):
+            if editor.property("kshShortcutId") == shortcut_id:
+                editor.setToolTip(
+                    str(detail) if detail else
+                    "Appuyez sur une touche ; clic droit pour saisir une combinaison déjà interceptée par KDE."
+                )
+
+    def _ksh_transfer_shortcut(self, shortcut_id: str, trigger: str) -> None:
+        """Move a chord between K-Sounds actions before assigning it in KDE.
+
+        Only K-Sounds' registered IDs are touched. Never steal an external
+        KDE shortcut. With the shared helper, SET(old, empty) is queued before
+        SET(new, chord), preserving event order.
+        """
+        wanted = str(trigger or "").strip()
+        if not wanted:
+            self._ksh_shortcut_feedback(shortcut_id)
+            return
+        try:
+            canonical = QKeySequence(wanted, QKeySequence.PortableText).toString(
+                QKeySequence.PortableText
+            ).casefold()
+        except Exception:
+            canonical = wanted.casefold()
+        displaced = []
+        for other in tuple(self.shortcut_registry.bindings()):
+            sid = other.shortcut_id
+            if sid == shortcut_id or not other.trigger:
+                continue
+            try:
+                key = QKeySequence(other.trigger, QKeySequence.PortableText).toString(
+                    QKeySequence.PortableText
+                ).casefold()
+            except Exception:
+                key = str(other.trigger).casefold()
+            if key != canonical:
+                continue
+            displaced.append((sid, other.description))
+            # Update our registry first, then unregister this exact K-Sounds
+            # action at KDE; never unregister shortcuts owned by other apps.
+            other.trigger = ""
+            other.enabled = False
+            bridge = (getattr(self, "_global_tune_shortcut", None)
+                      if sid == "micro.tune.toggle" else
+                      getattr(self, "_global_mixer_shortcuts", {}).get(sid))
+            setter = getattr(bridge, "set_trigger", None)
+            if callable(setter):
+                setter("")
+            if sid == "micro.tune.toggle":
+                self._sync_tune_legacy_settings_from_registry()
+                self._refresh_micro_processing_ab_shortcut(restart_global=False)
+                self._sync_tune_shortcut_runtime_ui()
+            elif sid.startswith("mixer."):
+                self._sync_channel_shortcut_ui(sid)
+            elif sid.startswith("soundboard."):
+                self._sync_soundboard_shortcut_ui(sid)
+            self._ksh_shortcut_feedback(sid)
+        transfer_notes = getattr(self, "_ksh_transfer_notes", None)
+        if transfer_notes is None:
+            transfer_notes = self._ksh_transfer_notes = {}
+        transfer_notes.pop(shortcut_id, None)
+        if displaced:
+            self._save_shortcut_registry_later()
+            owners = ", ".join(f"{name} ({sid})" for sid, name in displaced)
+            note = f"{wanted} transféré depuis {owners} vers {shortcut_id}"
+            self.backend_controller.status_changed.emit(note)
+            transfer_notes[shortcut_id] = note
+            self._ksh_shortcut_feedback(shortcut_id, note)
+        else:
+            self._ksh_shortcut_feedback(shortcut_id)
+
     def _update_micro_eq_preset_shortcut(
         self,
         profile_name: str,
@@ -16137,6 +16394,7 @@ QPushButton#exitNoButton:default {
                 )
                 return
             normalized = normalize_shortcut_trigger(requested)
+            self._ksh_transfer_shortcut(shortcut_id, normalized)
             binding.trigger = normalized
             binding.enabled = bool(normalized)
             self._save_shortcut_registry_later()
@@ -16145,11 +16403,16 @@ QPushButton#exitNoButton:default {
 
         if enabled is not None:
             requested_enabled = bool(enabled) and bool(str(binding.trigger or "").strip())
-            backend = self.shortcut_manager.backend_state(shortcut_id)
-            if requested_enabled and backend.authoritative and not backend.enabled:
-                requested_enabled = False
+            if requested_enabled:
+                self._ksh_transfer_shortcut(shortcut_id, binding.trigger)
             binding.enabled = requested_enabled
             self._save_shortcut_registry_later()
+            bridge = getattr(self, "_global_mixer_shortcuts", {}).get(shortcut_id)
+            setter = getattr(bridge, "set_trigger", None)
+            if callable(setter):
+                setter(binding.trigger if requested_enabled else "")
+            else:
+                QTimer.singleShot(0, lambda sid=shortcut_id: self._restart_global_mixer_shortcut(sid))
 
     def _register_core_shortcuts(self) -> None:
         settings = self.backend_controller.settings
@@ -16429,15 +16692,17 @@ QPushButton#exitNoButton:default {
         settings_changed = False
 
         if authoritative:
+            if kde_enabled and kde_trigger and not binding.enabled:
+                binding.enabled = True
+                settings_changed = True
             # KDE is the first authority. If KDE disables/removes the action,
             # K-Sounds must not keep its secondary switch enabled.
             if not kde_enabled:
                 if binding.enabled:
                     binding.enabled = False
                     settings_changed = True
-                if str(binding.trigger or ""):
-                    binding.trigger = ""
-                    settings_changed = True
+                # Keep a manually disabled chord in the editor;
+                # disabling KDE is distinct from deleting the saved key.
                 self._micro_processing_ab_sequence = QKeySequence()
 
             # Keep K-Sounds' saved/fallback key aligned with KDE when KDE gives
@@ -16460,7 +16725,13 @@ QPushButton#exitNoButton:default {
         self._sync_tune_shortcut_runtime_ui(state)
 
         if authoritative and "already used" in detail.lower():
-            self.backend_controller.status_changed.emit(detail)
+            hint = "Conflit KDE : " + detail + ". Libérez cette combinaison dans KDE ou choisissez-en une autre."
+            self._ksh_shortcut_feedback(shortcut_id, hint)
+            self.backend_controller.status_changed.emit(hint)
+        elif authoritative and kde_enabled:
+            self._ksh_shortcut_feedback(
+                shortcut_id, getattr(self, "_ksh_transfer_notes", {}).get(shortcut_id, "")
+            )
         elif authoritative and kde_enabled:
             self.backend_controller.status_changed.emit(
                 f"Global TUNE shortcut available — {kde_trigger or 'assigned'}"
@@ -16501,13 +16772,15 @@ QPushButton#exitNoButton:default {
         settings_changed = False
 
         if authoritative:
+            if kde_enabled and kde_trigger and not binding.enabled:
+                binding.enabled = True
+                settings_changed = True
             if not kde_enabled:
                 if binding.enabled:
                     binding.enabled = False
                     settings_changed = True
-                if str(binding.trigger or ""):
-                    binding.trigger = ""
-                    settings_changed = True
+                # Preserve the stored chord when unchecked, rather
+                # than erase it merely because KDE has no active binding.
             if kde_enabled and kde_trigger and ", " not in kde_trigger:
                 try:
                     sequence = QKeySequence(kde_trigger, QKeySequence.NativeText)
@@ -16526,7 +16799,15 @@ QPushButton#exitNoButton:default {
             self._sync_channel_shortcut_ui(shortcut_id)
 
         if authoritative and "already used" in detail.lower():
-            self.backend_controller.status_changed.emit(detail)
+            hint = "Conflit KDE : " + detail + ". Libérez cette combinaison dans KDE ou choisissez-en une autre."
+            self._ksh_shortcut_feedback(shortcut_id, hint)
+            self.backend_controller.status_changed.emit(hint)
+        elif authoritative and ("failed" in detail.lower() or "error" in detail.lower()):
+            self._ksh_shortcut_feedback(shortcut_id, "Erreur KDE : " + detail)
+        elif authoritative and kde_enabled:
+            self._ksh_shortcut_feedback(
+                shortcut_id, getattr(self, "_ksh_transfer_notes", {}).get(shortcut_id, "")
+            )
         elif detail and ("error" in detail.lower() or "failed" in detail.lower()):
             self.backend_controller.status_changed.emit(detail)
 
@@ -16559,7 +16840,7 @@ QPushButton#exitNoButton:default {
                     ),
                 )
                 bridges[sid] = bridge
-                bridge.start(trigger)
+                bridge.start(trigger if binding.enabled else "")
             self._global_mixer_shortcuts = bridges
         except Exception as exc:
             self.backend_controller.status_changed.emit(
@@ -16621,7 +16902,14 @@ QPushButton#exitNoButton:default {
                 ),
             )
             self._global_mixer_shortcuts[shortcut_id] = new_bridge
-            new_bridge.start(binding.trigger)
+            new_bridge.start(binding.trigger if binding.enabled else "")
+            # This restart follows an explicit user edit. REGISTER alone uses
+            # KDE Autoloading, which may resurrect an old persisted binding.
+            # Queue an authoritative SET, including the empty sequence.
+            if not new_bridge.set_trigger(binding.trigger if binding.enabled else ""):
+                self.backend_controller.status_changed.emit(
+                    "KDE could not persist the edited global shortcut"
+                )
         except Exception as exc:
             self.backend_controller.status_changed.emit(str(exc))
 
@@ -16648,6 +16936,7 @@ QPushButton#exitNoButton:default {
                 self._sync_channel_shortcut_ui(shortcut_id)
                 return
             normalized = normalize_shortcut_trigger(requested)
+            self._ksh_transfer_shortcut(shortcut_id, normalized)
             binding.trigger = normalized
             binding.enabled = bool(normalized)
 
@@ -16669,12 +16958,21 @@ QPushButton#exitNoButton:default {
 
         if enabled is not None:
             requested_enabled = bool(enabled) and bool(str(binding.trigger or "").strip())
-            backend = self.shortcut_manager.backend_state(shortcut_id)
-            if requested_enabled and backend.authoritative and not backend.enabled:
-                requested_enabled = False
+            if requested_enabled:
+                self._ksh_transfer_shortcut(shortcut_id, binding.trigger)
             binding.enabled = requested_enabled
             self._save_shortcut_registry_later()
             self._sync_channel_shortcut_ui(shortcut_id)
+            # The UI switch must also disable/enable the actual KDE shortcut.
+            bridge = getattr(self, "_global_mixer_shortcuts", {}).get(shortcut_id)
+            setter = getattr(bridge, "set_trigger", None)
+            if callable(setter):
+                if not setter(binding.trigger if requested_enabled else ""):
+                    self.backend_controller.status_changed.emit(
+                        "Impossible de synchroniser ce raccourci avec KDE"
+                    )
+            else:
+                QTimer.singleShot(0, lambda sid=shortcut_id: self._restart_global_mixer_shortcut(sid))
 
     def _update_soundboard_pad_shortcut(
         self,
@@ -16700,6 +16998,7 @@ QPushButton#exitNoButton:default {
                 return
 
             normalized = normalize_shortcut_trigger(requested)
+            self._ksh_transfer_shortcut(shortcut_id, normalized)
             binding.trigger = normalized
             binding.enabled = bool(normalized)
 
@@ -16724,14 +17023,22 @@ QPushButton#exitNoButton:default {
 
         if enabled is not None:
             requested_enabled = bool(enabled) and bool(str(binding.trigger or "").strip())
-            backend = self.shortcut_manager.backend_state(shortcut_id)
-            if requested_enabled and backend.authoritative and not backend.enabled:
-                requested_enabled = False
+            if requested_enabled:
+                self._ksh_transfer_shortcut(shortcut_id, binding.trigger)
             binding.enabled = requested_enabled
             self._save_shortcut_registry_later()
             self._sync_soundboard_shortcut_ui(shortcut_id)
+            bridge = getattr(self, "_global_mixer_shortcuts", {}).get(shortcut_id)
+            setter = getattr(bridge, "set_trigger", None)
+            if callable(setter):
+                if not setter(binding.trigger if requested_enabled else ""):
+                    self.backend_controller.status_changed.emit(
+                        "Impossible de synchroniser ce raccourci Pad avec KDE"
+                    )
+            else:
+                QTimer.singleShot(0, lambda sid=shortcut_id: self._restart_global_mixer_shortcut(sid))
 
-    def _start_global_tune_shortcut(self) -> None:
+    def _start_global_tune_shortcut(self, *, force_remap: bool = False) -> None:
         if not self.backend_controller.module_enabled("micro_tune"):
             self._global_tune_shortcut_active = False
             self.shortcut_manager.set_backend_state(
@@ -16771,7 +17078,11 @@ QPushButton#exitNoButton:default {
                 ),
             )
             self._global_tune_shortcut = bridge
-            state = bridge.start(trigger)
+            state = bridge.start(trigger if binding.enabled else "")
+            if force_remap and not bridge.set_trigger(trigger if binding.enabled else ""):
+                self.backend_controller.status_changed.emit(
+                    "KDE could not persist the edited TUNE shortcut"
+                )
             self.backend_controller.status_changed.emit(
                 f"Checking global TUNE shortcut state — {state.detail}"
             )
@@ -16811,7 +17122,8 @@ QPushButton#exitNoButton:default {
         if not hasattr(self, "_global_tune_shortcut"):
             return
         self._stop_global_tune_shortcut()
-        QTimer.singleShot(0, self._start_global_tune_shortcut)
+        # Unlike startup, this path is reached after an in-app user edit.
+        QTimer.singleShot(0, lambda: self._start_global_tune_shortcut(force_remap=True))
 
     def _configure_global_tune_shortcut(self) -> None:
         bridge = getattr(self, "_global_tune_shortcut", None)
@@ -16983,11 +17295,7 @@ QPushButton#exitNoButton:default {
         if key == "micro_processing_ab_shortcut_enabled":
             backend = self.shortcut_manager.backend_state("micro.tune.toggle")
             requested = bool(value)
-            if requested and backend.authoritative and not backend.enabled:
-                requested = False
-                self.backend_controller.status_changed.emit(
-                    "Assign a global shortcut before enabling this K-Sounds action"
-                )
+            # Allow reactivation of a previously disabled stored chord.
             self.shortcut_registry.set_binding(
                 "micro.tune.toggle", enabled=requested
             )
@@ -16995,6 +17303,10 @@ QPushButton#exitNoButton:default {
             # or recreate KDE's authoritative portal session.
             self._refresh_micro_processing_ab_shortcut(restart_global=False)
             self._save_shortcut_registry_later()
+            bridge = getattr(self, "_global_tune_shortcut", None)
+            setter = getattr(bridge, "set_trigger", None)
+            if callable(setter):
+                setter(self._tune_shortcut_binding().trigger if requested else "")
             self._sync_shared_visual_settings(key)
             return
 
@@ -17019,6 +17331,7 @@ QPushButton#exitNoButton:default {
             # snaps the editor back to the existing system binding.
             setter = getattr(bridge, "set_trigger", None)
             if backend.authoritative and callable(setter):
+                self._ksh_transfer_shortcut("micro.tune.toggle", trigger)
                 if not setter(trigger):
                     self.backend_controller.status_changed.emit(
                         "Could not update the global shortcut"
@@ -17036,8 +17349,9 @@ QPushButton#exitNoButton:default {
                 self._sync_tune_shortcut_runtime_ui()
                 return
 
+            self._ksh_transfer_shortcut("micro.tune.toggle", trigger)
             self.shortcut_registry.set_binding(
-                "micro.tune.toggle", trigger=trigger
+                "micro.tune.toggle", trigger=trigger, enabled=bool(trigger)
             )
             self._refresh_micro_processing_ab_shortcut(restart_global=True)
             self._save_shortcut_registry_later()

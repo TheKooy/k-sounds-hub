@@ -24,6 +24,11 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+// IP17p scoped subnormal handling; x86-only, independent of compiler -ffast-math.
+#include <cstdlib>
+#if defined(__SSE__) && (defined(__x86_64__) || defined(__i386__))
+#include <xmmintrin.h>
+#endif
 
 #include "voice_fx_dsp.hpp"
 #include "micro_tune_dsp.hpp"
@@ -1021,7 +1026,38 @@ void write_levels_file(
 
 } // namespace
 
+// IP17p scoped FTZ/DAZ on the native MICRO DSP thread.
+// In float32, subnormals are below ~1.175e-38 (about -758 dBFS), inaudible.
+// Preserve legacy calculations with KSH_MICRO_DENORMAL_MODE=legacy.
+// Only this process's main/DSP thread gets the MXCSR change.
+class KshMicroDenormalGuard final {
+public:
+    KshMicroDenormalGuard() noexcept {
+#if defined(__SSE__) && (defined(__x86_64__) || defined(__i386__))
+        previous_mxcsr_ = _mm_getcsr();
+        const char* preference = std::getenv("KSH_MICRO_DENORMAL_MODE");
+        if (preference == nullptr || std::strcmp(preference, "legacy") != 0) {
+            constexpr unsigned int ftz = 1u << 15;
+            constexpr unsigned int daz = 1u << 6;
+            _mm_setcsr(previous_mxcsr_ | ftz | daz);
+        }
+#endif
+    }
+    ~KshMicroDenormalGuard() noexcept {
+#if defined(__SSE__) && (defined(__x86_64__) || defined(__i386__))
+        _mm_setcsr(previous_mxcsr_);
+#endif
+    }
+    KshMicroDenormalGuard(const KshMicroDenormalGuard&) = delete;
+    KshMicroDenormalGuard& operator=(const KshMicroDenormalGuard&) = delete;
+private:
+#if defined(__SSE__) && (defined(__x86_64__) || defined(__i386__))
+    unsigned int previous_mxcsr_{0};
+#endif
+};
+
 int main(int argc, char** argv) {
+    KshMicroDenormalGuard denormal_guard;
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT, signal_handler);
     std::signal(SIGPIPE, SIG_IGN);

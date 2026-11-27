@@ -8,9 +8,9 @@ This project is being developed with AI assistance.
 
 ## Status
 
-Current public version: 0.4.7
+Current public version: 0.4.8
 
-Latest Linux release: v0.4.7
+Latest Linux release: v0.4.8
 
 Main tested environment:
 
